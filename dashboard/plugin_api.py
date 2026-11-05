@@ -682,7 +682,7 @@ def _cron_sequence(j: dict, skills: list[str]) -> list[dict]:
         )
     for s in skills:
         sequence.append(
-            {"type": "skill", "kind": "agent", "kindLabel": "agent",
+            {"type": "skill", "kind": "skill", "kindLabel": "skill",
              "label": s, "name": s}
         )
     if j.get("deliver") and j.get("deliver") != "local":
@@ -785,8 +785,8 @@ def _webhook_sequence(name: str, route: dict) -> list[dict]:
     })
     for skill in _string_list(route.get("skills")):
         steps.append({
-            "type": "skill", "kind": "agent", "label": skill,
-            "name": skill, "kindLabel": "agent",
+            "type": "skill", "kind": "skill", "label": skill,
+            "name": skill, "kindLabel": "skill",
         })
     deliver = route.get("deliver", "deliver")
     extra = route.get("deliver_extra") or {}

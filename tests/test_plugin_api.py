@@ -425,6 +425,7 @@ def test_cron_category_comes_from_the_first_attached_skill_that_exists(client, h
     assert "project" not in jobs["papers"]
     assert jobs["papers"]["schedule_human"] == "Weekdays at 9am"
     assert [s["name"] for s in jobs["papers"]["sequence"] if s["type"] == "skill"] == ["ghost", "arxiv"]
+    assert {(s["kind"], s["kindLabel"]) for s in jobs["papers"]["sequence"] if s["type"] == "skill"} == {("skill", "skill")}
     assert jobs["orphan"]["status"] == "paused"
     assert jobs["bare"]["status"] == "error"
     assert jobs["notes"]["sequence"][-1]["label"] == "telegram"
