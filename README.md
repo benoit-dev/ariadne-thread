@@ -51,6 +51,8 @@ An expanded step has an **Edit** button. It turns the step into a text box; **Sa
 - a webhook route's prompt template. Its secret and other fields are kept.
 - a script step's file in `scripts/`, unless it is over 256 KB.
 
+Scripts show with line numbers and syntax colours (Python, shell and JavaScript, picked by extension or shebang), and edit in a code editor: Tab and Shift+Tab indent or dedent the selected lines, Enter keeps the line's indent (one level more after a Python `:` or an opening bracket), and Backspace in leading spaces removes one indent level.
+
 Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Deliver and trigger steps are read-only.
 
 ### Ask an agent

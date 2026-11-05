@@ -13,7 +13,7 @@ import {
   SIDEBAR_NAV_AREA,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs, Fragment } from 'react/jsx-runtime'
-import { useState, useEffect, useRef, useLayoutEffect } from 'react'
+import { createContext, useContext, useState, useEffect, useRef, useLayoutEffect } from 'react'
 
 const ID = 'ariadne-thread'
 const SKILLS_EVENT = 'plugin.ariadne-thread.skills.changed'
@@ -175,10 +175,12 @@ function FlowArrow() {
 // The SDK cannot import a graph library, so a chain of node cards stands in for one.
 // Clicking a step expands it in place to show its content; a widened card keeps scripts readable.
 // Skill steps never expand: their "Go to skill" button opens the whole skill instead.
+// A lone step has nothing to scan past, so it opens expanded and does not collapse.
 // edit(step) returns { save(content, expected), ask(request) } for a step the user may change, else null.
 function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
   const [open, setOpen] = useState(() => new Set())
   if (!sequence || !sequence.length) return h(Note, { text: 'No steps' })
+  const single = sequence.length === 1
   const toggle = (i) =>
     setOpen((prev) => {
       const next = new Set(prev)
@@ -192,7 +194,8 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
       const st = kindStyle(step.kind || step.type)
       const skill = onOpenSkill ? skillTarget(step) : null
       const action = ctx && !skill ? stepAction(step) : null
-      const expanded = action && open.has(i)
+      const expanded = action && (single || open.has(i))
+      const toggleable = action && !single
       const editor = expanded && edit ? edit(step) : null
       const ask = editor && editor.ask ? (close) => h(AgentBox, { ctx, buildPrompt: editor.ask, onClose: close, placeholder: 'e.g. make this step also check…' }) : null
       const sub = step.kindLabel && step.kindLabel.toLowerCase() !== st.label.toLowerCase() ? step.kindLabel : null
@@ -203,8 +206,8 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
         h(
           'div',
           {
-            onClick: action ? () => toggle(i) : undefined,
-            title: action ? (expanded ? 'Collapse' : STEP_TITLE[action]) : undefined,
+            onClick: toggleable ? () => toggle(i) : undefined,
+            title: toggleable ? (expanded ? 'Collapse' : STEP_TITLE[action]) : undefined,
             style: {
               width: '100%',
               maxWidth: expanded ? '880px' : '440px',
@@ -215,7 +218,7 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
               borderRadius: '10px',
               background: 'linear-gradient(180deg, ' + mix(st.color, 9) + ', ' + mix(TXT1, 2) + ')',
               padding: '10px 12px',
-              cursor: action ? 'pointer' : 'default',
+              cursor: toggleable ? 'pointer' : 'default',
               display: 'flex',
               flexDirection: 'column',
               gap: '2px',
@@ -227,7 +230,7 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
             h('span', { style: { color: st.color, fontSize: '0.8125rem', lineHeight: '1' } }, st.icon),
             h('span', { style: { color: st.color, fontSize: '0.625rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' } }, st.label),
             sub ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: 'auto' } }, sub) : null,
-            action ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: sub ? '0' : 'auto' } }, expanded ? '▾' : '▸') : null,
+            toggleable ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: sub ? '0' : 'auto' } }, expanded ? '▾' : '▸') : null,
             skill
               ? h(
                   'button',
@@ -265,13 +268,18 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
   )
 }
 
+// The page's tab bar, rendered by ListDetail at the top of the list column.
+const TabsSlot = createContext(null)
+
 function ListDetail({ top, list, children }) {
+  const tabs = useContext(TabsSlot)
   return h(
     'div',
     { style: { display: 'flex', height: '100%', minHeight: 0 } },
     h(
       'div',
       { style: { width: '280px', flexShrink: 0, borderRight: '1px solid ' + STROKE, display: 'flex', flexDirection: 'column', minHeight: 0 } },
+      tabs,
       top || null,
       h('div', { style: { flex: '1', overflowY: 'auto', minHeight: 0 } }, list)
     ),
@@ -313,9 +321,9 @@ function CronsTab({ ctx, profile, nav, onOpenSkill }) {
   }, [nav])
 
   const failed = gate(q, 'crons')
-  if (failed) return failed
+  if (failed) return h(ListDetail, { list: failed })
   const jobs = (q.data && q.data.jobs) || []
-  if (!jobs.length) return h(Note, { text: 'No cron jobs' })
+  if (!jobs.length) return h(ListDetail, { list: h(Note, { text: 'No cron jobs' }) })
   const job = pick(jobs, selected)
 
   return h(
@@ -364,9 +372,9 @@ function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
   }, [nav])
 
   const failed = gate(q, 'webhooks')
-  if (failed) return failed
+  if (failed) return h(ListDetail, { list: failed })
   const routes = (q.data && q.data.routes) || []
-  if (!routes.length) return h(Note, { text: 'No webhooks' })
+  if (!routes.length) return h(ListDetail, { list: h(Note, { text: 'No webhooks' }) })
   const route = pick(routes, selected)
 
   return h(
@@ -416,13 +424,203 @@ const primaryButton = (disabled) => ({
 
 const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO }
 
+// A small code editor: no editor library can be loaded, since a disk plugin imports only the SDK and React.
+// Each language is one regex whose groups name the token; words are then sorted into keywords and builtins.
+const words = (s) => new Set(s.split(' '))
+const LANGS = {
+  python: {
+    re: /(#[^\n]*)|((?:\b[rRbBuUfF]{1,2})?(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?))|(@[A-Za-z_][\w.]*)|(\b0[xXoObB][\da-fA-F_]+\b|\b\d[\d_]*(?:\.\d*)?(?:[eE][+-]?\d+)?j?\b)|([A-Za-z_]\w*)/g,
+    keywords: words('and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield match case'),
+    builtins: words('True False None self cls print len range open str int float bool list dict set tuple type isinstance super Exception'),
+    defs: words('def class'),
+    opener: /:\s*(#.*)?$/,
+  },
+  shell: {
+    re: /((?<![^\s;])#[^\n]*)|("(?:\\.|[^"\\])*"?|'[^']*'?)|(\$\{[^}\n]*\}?|\$[\w@#?$!*-])|(\b\d+\b)|([A-Za-z_][\w-]*)/g,
+    keywords: words('if then else elif fi for while until do done case esac in function return export local readonly set unset shift exit break continue source'),
+    builtins: words('echo printf cd test true false read eval exec trap wait'),
+    defs: words('function'),
+    opener: /(\bthen|\bdo|\{|\()\s*$/,
+  },
+  js: {
+    re: /(\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))|("(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?|`(?:\\.|[^`\\])*`?)|(@[A-Za-z_][\w.]*)|(\b0[xXoObB][\da-fA-F_]+n?\b|\b\d[\d_]*(?:\.\d*)?(?:[eE][+-]?\d+)?n?\b)|([A-Za-z_$][\w$]*)/g,
+    keywords: words('async await break case catch class const continue default delete do else export extends finally for from function if import in instanceof let new of return static switch throw try typeof var void while yield'),
+    builtins: words('true false null undefined this super console process require module'),
+    defs: words('function class'),
+    opener: /[{[(]\s*$/,
+  },
+}
+const TOKEN_GROUPS = ['comment', 'string', 'decorator', 'number']
+
+const scriptLang = (path, content) => {
+  const ext = (/\.(\w+)$/.exec(path) || [])[1]
+  if (ext === 'py') return 'python'
+  if (ext === 'sh' || ext === 'bash' || ext === 'zsh') return 'shell'
+  if (['js', 'mjs', 'cjs', 'ts'].includes(ext)) return 'js'
+  const bang = /^#!.*\b(python3?|node|bash|zsh|sh)\b/.exec(content || '')
+  if (!bang) return 'plain'
+  return bang[1].startsWith('python') ? 'python' : bang[1] === 'node' ? 'js' : 'shell'
+}
+
+const TOKEN_STYLE = {
+  comment: { color: TXT4, fontStyle: 'italic' },
+  string: { color: GREEN },
+  decorator: { color: AMBER },
+  number: { color: AMBER },
+  keyword: { color: 'var(--ui-purple, #a855f7)' },
+  builtin: { color: 'var(--ui-cyan, #06b6d4)' },
+  def: { color: BLUE },
+}
+
+function highlight(text, lang) {
+  const spec = LANGS[lang]
+  if (!spec) return text
+  const out = []
+  let at = 0
+  let prevWord = null
+  for (const m of text.matchAll(spec.re)) {
+    if (m.index > at) out.push(text.slice(at, m.index))
+    at = m.index + m[0].length
+    let kind = TOKEN_GROUPS.find((_, i) => m[i + 1] !== undefined)
+    if (!kind) {
+      kind = prevWord && spec.defs.has(prevWord) ? 'def' : spec.keywords.has(m[0]) ? 'keyword' : spec.builtins.has(m[0]) ? 'builtin' : null
+      prevWord = m[0]
+    }
+    out.push(kind ? h('span', { key: out.length, style: TOKEN_STYLE[kind] }, m[0]) : m[0])
+  }
+  out.push(text.slice(at))
+  return out
+}
+
+// The indent the file already uses: tabs, else its smallest space indent, else four spaces.
+const indentUnit = (text) => {
+  if (/^\t/m.test(text)) return '\t'
+  const sizes = (text.match(/^ +(?=\S)/gm) || []).map((s) => s.length)
+  const n = sizes.length ? Math.min(...sizes) : 4
+  return ' '.repeat(Math.min(8, Math.max(2, n)))
+}
+
+// Replaces [start, end) through the browser's own editing, so ⌘Z still undoes it, then selects [selStart, selEnd).
+function replaceRange(ta, start, end, text, selStart, selEnd) {
+  ta.setSelectionRange(start, end)
+  const done = text ? document.execCommand('insertText', false, text) : start === end || document.execCommand('delete')
+  if (!done) {
+    ta.setRangeText(text, start, end, 'end')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+  if (selStart !== undefined) ta.setSelectionRange(selStart, selEnd)
+}
+
+// Tab and Shift+Tab indent or dedent the selected lines, Enter keeps the line's indent (one more after
+// an opener such as a Python colon), and Backspace in leading spaces removes one indent step.
+function codeKey(e, ta, lang, unit) {
+  if (e.metaKey || e.ctrlKey || e.altKey) return
+  const v = ta.value
+  const s = ta.selectionStart
+  const end = ta.selectionEnd
+  const lineStart = v.lastIndexOf('\n', s - 1) + 1
+  if (e.key === 'Tab') {
+    e.preventDefault()
+    if (!e.shiftKey && s === end) return replaceRange(ta, s, end, unit)
+    const blockEnd = end > s && v[end - 1] === '\n' ? end - 1 : end
+    const lines = v.slice(lineStart, blockEnd).split('\n')
+    const next = lines.map((l) => (e.shiftKey ? l.replace(new RegExp('^(\\t| {1,' + unit.length + '})'), '') : l ? unit + l : l)).join('\n')
+    const first = e.shiftKey ? lines[0].length - next.split('\n')[0].length : lines[0] ? unit.length : 0
+    return replaceRange(ta, lineStart, blockEnd, next, Math.max(lineStart, s + (e.shiftKey ? -first : first)), blockEnd + next.length - (blockEnd - lineStart) + (end - blockEnd))
+  }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    const before = v.slice(lineStart, s)
+    const lead = /^[ \t]*/.exec(before)[0]
+    return replaceRange(ta, s, end, '\n' + lead + (LANGS[lang] && LANGS[lang].opener.test(before) ? unit : ''))
+  }
+  if (e.key === 'Backspace' && s === end && unit !== '\t' && s > lineStart) {
+    const before = v.slice(lineStart, s)
+    if (/^ +$/.test(before)) {
+      e.preventDefault()
+      replaceRange(ta, s - ((before.length - 1) % unit.length) - 1, s, '')
+    }
+  }
+}
+
+// Line numbers beside highlighted text. With onChange, a transparent textarea lies exactly over the
+// highlighted copy, so the browser still does the caret, selection, undo and IME.
+function CodeArea({ value, lang, maxHeight, onChange, onKeyDown }) {
+  const ref = useRef(null)
+  const unit = useRef(null)
+  if (unit.current === null) unit.current = indentUnit(value)
+  useEffect(() => {
+    if (onChange && ref.current) ref.current.focus({ preventScroll: true })
+  }, [])
+  const lines = value.split('\n').length
+  const text = { margin: 0, padding: '12px', fontFamily: MONO, fontSize: '0.75rem', lineHeight: '1.5', tabSize: 4, whiteSpace: 'pre', fontVariantLigatures: 'none', letterSpacing: 0 }
+  return h(
+    'div',
+    {
+      style: {
+        maxHeight,
+        overflow: 'auto',
+        borderRadius: '8px',
+        background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))',
+        border: '1px solid ' + (onChange ? ACCENT : 'transparent'),
+      },
+    },
+    h(
+      'div',
+      { style: { display: 'flex', width: 'max-content', minWidth: '100%' } },
+      h(
+        'pre',
+        { 'aria-hidden': true, style: { ...text, paddingRight: '8px', color: TXT4, textAlign: 'right', userSelect: 'none', borderRight: '1px solid ' + STROKE } },
+        Array.from({ length: lines }, (_, i) => i + 1).join('\n')
+      ),
+      h(
+        'div',
+        { style: { position: 'relative', flex: 1 } },
+        // The trailing space gives a final empty line its height, as the textarea gives it.
+        h('pre', { 'aria-hidden': !!onChange, style: { ...text, color: TXT2 } }, highlight(value, lang), ' '),
+        onChange
+          ? h('textarea', {
+              ref,
+              value,
+              wrap: 'off',
+              spellCheck: false,
+              autoCapitalize: 'off',
+              autoCorrect: 'off',
+              onChange: (e) => onChange(e.target.value),
+              onKeyDown: (e) => {
+                onKeyDown && onKeyDown(e)
+                codeKey(e, e.currentTarget, lang, unit.current)
+              },
+              style: {
+                ...text,
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                boxSizing: 'border-box',
+                border: 'none',
+                outline: 'none',
+                resize: 'none',
+                overflow: 'hidden',
+                background: 'transparent',
+                color: 'transparent',
+                caretColor: TXT1,
+              },
+            })
+          : null
+      )
+    )
+  )
+}
+
 // Shows text, and with onSave an Edit button that swaps it for a textarea in place.
 // The text at the moment Edit is clicked is what the save claims to replace, so polling can refresh
 // `value` underneath an open editor without losing the draft or hiding a concurrent change.
 // ask(close), when given, adds an "Ask agent" button that opens the returned box docked under the text.
 // With maxHeight only the text scrolls, so the buttons above it and the box below it stay in view.
 // Without it the box sticks to the bottom of a scrolling parent, so on a long text it stays in view.
-function TextEditor({ value, onSave, hint, ask, maxHeight }) {
+// With lang, the text shows as highlighted code with line numbers and edits in CodeArea.
+function TextEditor({ value, onSave, hint, ask, maxHeight, lang }) {
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState('')
   const [err, setErr] = useState(null)
@@ -443,7 +641,11 @@ function TextEditor({ value, onSave, hint, ask, maxHeight }) {
             onSave ? h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null); setAsking(false) }, style: smallButton }, '✎ Edit') : null
           )
         : null,
-      maxHeight ? h('div', { style: { maxHeight, overflowY: 'auto', borderRadius: '8px' } }, h('pre', { style: codeBlock }, value)) : h('pre', { style: codeBlock }, value),
+      lang
+        ? h(CodeArea, { value, lang, maxHeight })
+        : maxHeight
+          ? h('div', { style: { maxHeight, overflowY: 'auto', borderRadius: '8px' } }, h('pre', { style: codeBlock }, value))
+          : h('pre', { style: codeBlock }, value),
       ask && asking
         ? h(
             'div',
@@ -475,22 +677,25 @@ function TextEditor({ value, onSave, hint, ask, maxHeight }) {
     }
     setBusy(false)
   }
+  const onKeyDown = (e) => {
+    if (e.key === 'Escape') setDraft(null)
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit()
+  }
   return h(
     Fragment,
     {},
     hint ? h('div', { style: { marginBottom: '6px', fontSize: '0.6875rem', color: TXT4 } }, hint) : null,
-    h('textarea', {
-      value: draft,
-      autoFocus: true,
-      onChange: (e) => setDraft(e.target.value),
-      onKeyDown: (e) => {
-        if (e.key === 'Escape') setDraft(null)
-        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit()
-      },
-      spellCheck: false,
-      rows: Math.min(30, Math.max(6, draft.split('\n').length + 1)),
-      style: { ...codeBlock, width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid ' + ACCENT, outline: 'none', whiteSpace: 'pre', overflowX: 'auto' },
-    }),
+    lang
+      ? h(CodeArea, { value: draft, lang, maxHeight: maxHeight || '70vh', onChange: setDraft, onKeyDown })
+      : h('textarea', {
+          value: draft,
+          autoFocus: true,
+          onChange: (e) => setDraft(e.target.value),
+          onKeyDown,
+          spellCheck: false,
+          rows: Math.min(30, Math.max(6, draft.split('\n').length + 1)),
+          style: { ...codeBlock, width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid ' + ACCENT, outline: 'none', whiteSpace: 'pre', overflowX: 'auto' },
+        }),
     err ? h('div', { style: { marginTop: '6px', color: RED, fontSize: '0.75rem' } }, err) : null,
     h(
       'div',
@@ -652,7 +857,7 @@ function SkillsTab({ ctx, profile, nav, onNavigate }) {
   }, [nav])
 
   const failed = gate(q, 'skills')
-  if (failed) return failed
+  if (failed) return h(ListDetail, { list: failed })
 
   const open = (name) => {
     setFilter('')
@@ -910,7 +1115,7 @@ function ScriptBody({ ctx, profile, script, onSave, ask, maxHeight }) {
     {},
     h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
     s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes. Too large to edit here.') : null,
-    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask, maxHeight })
+    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask, maxHeight, lang: scriptLang(s.path, s.content) })
   )
 }
 
@@ -993,6 +1198,18 @@ function AriadnePage({ ctx }) {
   }, [ctx])
 
   const Active = { crons: CronsTab, webhooks: WebhooksTab, skills: SkillsTab }[tab]
+  const tabBar = h(
+    'div',
+    { style: { padding: '8px', borderBottom: '1px solid ' + STROKE } },
+    h(TabBar, {
+      tabs: TABS,
+      tab,
+      onTab: (id) => {
+        setNav(null)
+        setTab(id)
+      },
+    })
+  )
 
   return h(
     'div',
@@ -1001,19 +1218,15 @@ function AriadnePage({ ctx }) {
       'div',
       { style: { display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', borderBottom: '1px solid ' + STROKE } },
       h('div', { style: { fontWeight: 600, fontSize: '0.875rem', color: TXT2 } }, "Ariadne's Thread"),
-      h(TabBar, {
-        tabs: TABS,
-        tab,
-        onTab: (id) => {
-          setNav(null)
-          setTab(id)
-        },
-      }),
       profile !== 'default' ? h(Badge, {}, 'read-only') : null,
       h(ProfileSelect, { ctx, profile, onChange: setProfile })
     ),
     // Keyed by profile so a selection from one profile never leaks into another.
-    h('div', { style: { flex: '1', minHeight: 0 } }, h(Active, { key: profile, ctx, profile, nav, onOpenSkill: (name, from) => navigate('skills', name, from), onNavigate: navigate }))
+    h(
+      TabsSlot.Provider,
+      { value: tabBar },
+      h('div', { style: { flex: '1', minHeight: 0 } }, h(Active, { key: profile, ctx, profile, nav, onOpenSkill: (name, from) => navigate('skills', name, from), onNavigate: navigate }))
+    )
   )
 }
 

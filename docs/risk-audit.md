@@ -63,7 +63,7 @@ There are none. The plugin does not call `subprocess`, `os.system`, `session.cre
 
 ### Desktop SDK use
 
-`desktop/plugin.js` imports only `@hermes/plugin-sdk`, `react`, and `react/jsx-runtime`. It uses `ctx.rest`, `ctx.onEvent`, `ctx.setTimeout`, `ctx.addEventListener`, `ctx.os.writeClipboard`, `host.navigate`, `host.composer.setDraft`, and `host.notify`. It does not use `eval`, `new Function`, dynamic `import()`, `window.hermesDesktop`, or queries against the app's own markup. `hermes plugins validate` reports `desktop surface: stays inside the plugin SDK surface`.
+`desktop/plugin.js` imports only `@hermes/plugin-sdk`, `react`, and `react/jsx-runtime`. It uses `ctx.rest`, `ctx.onEvent`, `ctx.setTimeout`, `ctx.addEventListener`, `ctx.os.writeClipboard`, `host.navigate`, `host.composer.setDraft`, and `host.notify`. The script editor calls `document.execCommand('insertText')` on its own textarea so that indenting stays undoable. It does not use `eval`, `new Function`, dynamic `import()`, `window.hermesDesktop`, or queries against the app's own markup. `hermes plugins validate` reports `desktop surface: stays inside the plugin SDK surface`.
 
 ### Credentials
 
