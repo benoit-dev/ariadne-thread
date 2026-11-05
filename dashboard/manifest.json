@@ -1,0 +1,13 @@
+{
+  "name": "ariadne-thread",
+  "label": "Ariadne's Thread",
+  "description": "n8n-style flows for your Hermes skills and crons.",
+  "icon": "Workflow",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/ariadne-thread",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
