@@ -514,7 +514,7 @@ def test_flow_from_step_and_phase_headings(api):
     assert result["fallback"] is False
     assert labels(result) == ["Gather inputs", "Build", "Stage 3"]
     assert result["steps"][0]["detail"] == "Collect what the user gave you."
-    assert result["steps"][0]["type"] == result["steps"][0]["kind"] == "agent"
+    assert result["steps"][0]["type"] == result["steps"][0]["kind"] == "prompt"
 
 
 def test_flow_from_numbered_headings_prefers_the_outermost_level(api):
@@ -659,7 +659,7 @@ def test_fallback_to_a_single_step_named_after_the_skill(api):
 
     assert (result["strategy"], result["fallback"]) == ("single", True)
     assert result["steps"] == [
-        {"type": "agent", "kind": "agent", "kindLabel": "agent", "label": "lonely", "detail": "Does one thing."}
+        {"type": "prompt", "kind": "prompt", "kindLabel": "prompt", "label": "lonely", "detail": "Does one thing."}
     ]
     assert api.parse_skill_flow({}, "")["steps"][0]["label"] == "Skill"
 
@@ -690,8 +690,8 @@ def test_step_kinds(api):
         ("skill", "release-notes"),
         ("script", None),
         ("script", None),
-        ("agent", None),
-        ("agent", None),
+        ("prompt", None),
+        ("prompt", None),
         ("skill", "triage"),
     ]
 
@@ -699,7 +699,7 @@ def test_step_kinds(api):
 def test_a_skill_does_not_reference_itself(api):
     result = flow(api, '## Step 1: a\nskill_view(name="me", file_path="references/x.md")\n## Step 2: b\ntext\n', name="me")
 
-    assert [s["kind"] for s in result["steps"]] == ["agent", "agent"]
+    assert [s["kind"] for s in result["steps"]] == ["prompt", "prompt"]
 
 
 def test_labels_and_details_are_cleaned_and_bounded(api):
@@ -725,7 +725,7 @@ def test_step_shape_matches_what_the_pipeline_renders(api):
     for body in ("## Step 1: a\nx\n## Step 2: b\ny\n", "1. one\n2. two\n", "## A\nx\n## B\ny\n", "prose"):
         for step in api.parse_skill_flow({}, body)["steps"]:
             assert set(step) >= {"type", "kind", "kindLabel", "label", "detail"}
-            assert step["kind"] in {"agent", "script", "skill"}
+            assert step["kind"] in {"prompt", "script", "skill"}
 
 
 def test_script_steps_name_the_script_and_prompts_carry_their_full_text(client, home):
@@ -741,7 +741,7 @@ def test_script_steps_name_the_script_and_prompts_carry_their_full_text(client, 
     jobs = {j["name"]: j for j in client.get("/crons").json()["jobs"]}
 
     snap, _ = jobs["snap"]["sequence"]
-    assert (snap["kind"], snap["script"]) == ("deterministic", "snapshot.py")
+    assert (snap["kind"], snap["script"]) == ("script", "snapshot.py")
     script, prompt, _ = jobs["gate"]["sequence"]
     assert (script["kind"], script["script"]) == ("script", "gate.sh")
     assert prompt["body"] == long_prompt and len(prompt["detail"]) == 80

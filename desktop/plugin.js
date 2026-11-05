@@ -32,18 +32,42 @@ const RED = 'var(--ui-red, #ef4444)'
 const AMBER = 'var(--ui-orange, #f59e0b)'
 const GREEN = 'var(--ui-green, #22c55e)'
 const BLUE = 'var(--ui-blue, #3b82f6)'
+// Hermes's own corner radius: follows the theme, and the default theme renders it at about 2px.
+const RADIUS = 'var(--radius-md, 2px)'
 const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace'
 
 const mix = (color, pct) => 'color-mix(in srgb, ' + color + ' ' + pct + '%, transparent)'
 
+// Step icons: 24×24 line drawings stroked in currentColor, so they follow the theme accent.
 const KIND_STYLE = {
-  trigger: { color: GREEN, icon: '⚡', label: 'Trigger' },
-  agent: { color: GREEN, icon: '◈', label: 'Agent' },
-  prompt: { color: TXT3, icon: '📄', label: 'Prompt' },
-  skill: { color: GREEN, icon: '🛡', label: 'Skill' },
-  script: { color: AMBER, icon: '🖥', label: 'Script' },
-  deterministic: { color: AMBER, icon: '⚙', label: 'Deterministic' },
-  deliver: { color: BLUE, icon: '📤', label: 'Deliver' },
+  trigger: {
+    label: 'Trigger',
+    icon: [
+      ['circle', { cx: 12, cy: 12, r: 1.6, fill: 'currentColor', stroke: 'none' }],
+      ['path', { d: 'M8.6 8.6a4.8 4.8 0 0 0 0 6.8M15.4 8.6a4.8 4.8 0 0 1 0 6.8M5.8 5.8a8.8 8.8 0 0 0 0 12.4M18.2 5.8a8.8 8.8 0 0 1 0 12.4' }],
+    ],
+  },
+  prompt: {
+    label: 'Prompt',
+    icon: [['path', { d: 'M11 4c.6 4.6 2.9 6.9 7.5 7.5-4.6.6-6.9 2.9-7.5 7.5-.6-4.6-2.9-6.9-7.5-7.5 4.6-.6 6.9-2.9 7.5-7.5zM18.5 3v3.5M16.75 4.75h3.5' }]],
+  },
+  skill: { label: 'Skill', icon: [['path', { d: 'M13 3v7h6l-8 11v-7H5l8-11z' }]] },
+  script: {
+    label: 'Script',
+    icon: [
+      ['rect', { x: 3, y: 4.5, width: 18, height: 15, rx: 2.5 }],
+      ['path', { d: 'M7 10l3 2.5-3 2.5M12.5 15.5H17' }],
+    ],
+  },
+  deliver: { label: 'Deliver', icon: [['path', { d: 'M20.5 3.5L3.5 10.5l7 3 3 7 7-17zM10.5 13.5l4-4' }]] },
+}
+
+function StepIcon({ shapes }) {
+  return h(
+    'svg',
+    { width: 14, height: 14, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', style: { flexShrink: 0, display: 'block' } },
+    ...shapes.map(([tag, attrs], i) => jsx(tag, attrs, i))
+  )
 }
 
 const kindStyle = (kind) => KIND_STYLE[kind] || KIND_STYLE.prompt
@@ -217,10 +241,10 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
               maxWidth: expanded ? '880px' : '440px',
               transition: 'max-width 160ms ease',
               margin: '0 auto',
-              border: '1px solid ' + mix(st.color, 30),
-              borderLeft: '3px solid ' + st.color,
-              borderRadius: '10px',
-              background: 'linear-gradient(180deg, ' + mix(st.color, 9) + ', ' + mix(TXT1, 2) + ')',
+              border: '1px solid ' + mix(ACCENT, 30),
+              borderLeft: '3px solid ' + ACCENT,
+              borderRadius: RADIUS,
+              background: 'linear-gradient(180deg, ' + mix(ACCENT, 9) + ', ' + mix(TXT1, 2) + ')',
               padding: '10px 12px',
               cursor: toggleable ? 'pointer' : 'default',
               display: 'flex',
@@ -231,8 +255,8 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
           h(
             'div',
             { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
-            h('span', { style: { color: st.color, fontSize: '0.8125rem', lineHeight: '1' } }, st.icon),
-            h('span', { style: { color: st.color, fontSize: '0.625rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' } }, st.label),
+            h('span', { style: { color: ACCENT, display: 'flex' } }, h(StepIcon, { shapes: st.icon })),
+            h('span', { style: { color: ACCENT, fontSize: '0.625rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' } }, st.label),
             sub ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: 'auto' } }, sub) : null,
             toggleable ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: sub ? '0' : 'auto' } }, expanded ? '▾' : '▸') : null,
             skill
@@ -406,7 +430,7 @@ function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
 
 const outlineButton = {
   padding: '6px 12px',
-  borderRadius: '6px',
+  borderRadius: RADIUS,
   border: '1px solid ' + STROKE,
   background: 'transparent',
   color: TXT2,
@@ -418,7 +442,7 @@ const smallButton = { ...outlineButton, padding: '3px 10px', fontSize: '0.75rem'
 
 const primaryButton = (disabled) => ({
   padding: '6px 14px',
-  borderRadius: '6px',
+  borderRadius: RADIUS,
   border: '1px solid ' + ACCENT,
   background: mix(ACCENT, 18),
   color: TXT1,
@@ -428,7 +452,7 @@ const primaryButton = (disabled) => ({
   whiteSpace: 'nowrap',
 })
 
-const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO }
+const codeBlock = { margin: 0, padding: '12px', borderRadius: RADIUS, background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO }
 
 // A small code editor: no editor library can be loaded, since a disk plugin imports only the SDK and React.
 // Each language is one regex whose groups name the token; words are then sorted into keywords and builtins.
@@ -566,7 +590,7 @@ function CodeArea({ value, lang, maxHeight, onChange, onKeyDown }) {
       style: {
         maxHeight,
         overflow: 'auto',
-        borderRadius: '8px',
+        borderRadius: RADIUS,
         background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))',
         border: '1px solid ' + (onChange ? ACCENT : 'transparent'),
       },
@@ -650,7 +674,7 @@ function TextEditor({ value, onSave, hint, ask, maxHeight, lang }) {
       lang
         ? h(CodeArea, { value, lang, maxHeight })
         : maxHeight
-          ? h('div', { style: { maxHeight, overflowY: 'auto', borderRadius: '8px' } }, h('pre', { style: codeBlock }, value))
+          ? h('div', { style: { maxHeight, overflowY: 'auto', borderRadius: RADIUS } }, h('pre', { style: codeBlock }, value))
           : h('pre', { style: codeBlock }, value),
       ask && asking
         ? h(
@@ -660,7 +684,7 @@ function TextEditor({ value, onSave, hint, ask, maxHeight, lang }) {
                 ...(maxHeight ? {} : { position: 'sticky', bottom: 0, zIndex: 1 }),
                 marginTop: '8px',
                 padding: '8px 10px 10px',
-                borderRadius: '8px',
+                borderRadius: RADIUS,
                 border: '1px solid ' + STROKE,
                 background: 'var(--ui-bg-elevated, #1f2937)',
                 boxShadow: '0 -6px 16px rgba(0,0,0,0.12)',
@@ -873,7 +897,7 @@ function SkillsTab({ ctx, profile, nav, onNavigate }) {
     value: filter,
     onChange: (e) => setFilter(e.target.value),
     placeholder: 'Filter skills',
-    style: { margin: '8px', padding: '5px 8px', fontSize: '0.75rem', borderRadius: '6px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
+    style: { margin: '8px', padding: '5px 8px', fontSize: '0.75rem', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
   })
   const list = groups.length
     ? groups.map(([category, items]) =>
@@ -1056,7 +1080,7 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
               onClick: onClose,
               title: 'Close',
               'aria-label': 'Close',
-              style: { flexShrink: 0, width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, borderRadius: '4px', border: 'none', background: 'transparent', color: TXT4, cursor: 'pointer' },
+              style: { flexShrink: 0, width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, borderRadius: RADIUS, border: 'none', background: 'transparent', color: TXT4, cursor: 'pointer' },
             },
             h(
               'svg',
@@ -1069,7 +1093,7 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
     ),
     h(
       'div',
-      { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '6px 6px 6px 10px', borderRadius: '8px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)' } },
+      { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '6px 6px 6px 10px', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)' } },
       h('textarea', {
         ref,
         rows: 2,
@@ -1094,7 +1118,7 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
           disabled: busy || empty,
           title: 'Draft in new chat',
           'aria-label': 'Draft in new chat',
-          style: { flexShrink: 0, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, borderRadius: '6px', border: 'none', background: empty ? mix(ACCENT, 10) : ACCENT, color: empty ? TXT4 : 'var(--ui-text-on-accent, #fff)', cursor: busy || empty ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 },
+          style: { flexShrink: 0, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, borderRadius: RADIUS, border: 'none', background: empty ? mix(ACCENT, 10) : ACCENT, color: empty ? TXT4 : 'var(--ui-text-on-accent, #fff)', cursor: busy || empty ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 },
         },
         h(
           'svg',
@@ -1272,7 +1296,7 @@ function TabBar({ tabs, tab, onTab }) {
           onClick: () => onTab(t.id),
           style: {
             padding: '4px 10px',
-            borderRadius: '6px',
+            borderRadius: RADIUS,
             border: 'none',
             background: tab === t.id ? mix(ACCENT, 14) : 'transparent',
             color: tab === t.id ? TXT1 : TXT3,
@@ -1300,7 +1324,7 @@ function ProfileSelect({ ctx, profile, onChange }) {
       value: profile,
       onChange: (e) => onChange(e.target.value),
       title: 'Profile',
-      style: { marginLeft: 'auto', padding: '3px 6px', fontSize: '0.75rem', borderRadius: '6px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit' },
+      style: { marginLeft: 'auto', padding: '3px 6px', fontSize: '0.75rem', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit' },
     },
     profiles.map((p) => h('option', { key: p, value: p }, p))
   )
