@@ -253,10 +253,10 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
             ? h(
                 'div',
                 // Clicks inside the content (selecting, scrolling) must not collapse the card.
-                { onClick: (e) => e.stopPropagation(), style: { marginTop: '8px', maxHeight: '60vh', overflowY: 'auto', cursor: 'auto' } },
+                { onClick: (e) => e.stopPropagation(), style: { marginTop: '8px', cursor: 'auto' } },
                 step.script
-                  ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save, ask })
-                  : h(TextEditor, { value: step.body, onSave: editor && editor.save, ask })
+                  ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save, ask, maxHeight: '60vh' })
+                  : h(TextEditor, { value: step.body, onSave: editor && editor.save, ask, maxHeight: '60vh' })
               )
             : null
         )
@@ -420,8 +420,9 @@ const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background:
 // The text at the moment Edit is clicked is what the save claims to replace, so polling can refresh
 // `value` underneath an open editor without losing the draft or hiding a concurrent change.
 // ask(close), when given, adds an "Ask agent" button that opens the returned box docked under the text.
-// The box sticks to the bottom of a scrolling parent, so on a long step it stays in view over the text.
-function TextEditor({ value, onSave, hint, ask }) {
+// With maxHeight only the text scrolls, so the buttons above it and the box below it stay in view.
+// Without it the box sticks to the bottom of a scrolling parent, so on a long text it stays in view.
+function TextEditor({ value, onSave, hint, ask, maxHeight }) {
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState('')
   const [err, setErr] = useState(null)
@@ -442,15 +443,13 @@ function TextEditor({ value, onSave, hint, ask }) {
             onSave ? h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null); setAsking(false) }, style: smallButton }, '✎ Edit') : null
           )
         : null,
-      h('pre', { style: codeBlock }, value),
+      maxHeight ? h('div', { style: { maxHeight, overflowY: 'auto', borderRadius: '8px' } }, h('pre', { style: codeBlock }, value)) : h('pre', { style: codeBlock }, value),
       ask && asking
         ? h(
             'div',
             {
               style: {
-                position: 'sticky',
-                bottom: 0,
-                zIndex: 1,
+                ...(maxHeight ? {} : { position: 'sticky', bottom: 0, zIndex: 1 }),
                 marginTop: '8px',
                 padding: '8px 10px 10px',
                 borderRadius: '8px',
@@ -798,7 +797,7 @@ async function draftInNewChat(ctx, text) {
 
 // One request box for an agent: the skill as a whole at the bottom of the Skills tab, or one step
 // inside its expanded card. buildPrompt(request) gives the full prompt for the new chat.
-// onClose, when given, makes the box dismissable: it takes focus on open and Esc closes it.
+// onClose, when given, makes the box dismissable: it takes focus on open, and Esc or the × closes it.
 function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
   const [request, setRequest] = useState('')
   const [busy, setBusy] = useState(false)
@@ -835,13 +834,34 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
   return h(
     'div',
     {},
-    h('div', { style: { marginBottom: '6px' } }, h(SectionLabel, { text: label || 'Ask an agent to change it' })),
+    h(
+      'div',
+      { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px', marginBottom: '6px' } },
+      h(SectionLabel, { text: label || 'Ask an agent to change it' }),
+      onClose
+        ? h(
+            'button',
+            {
+              onClick: onClose,
+              title: 'Close',
+              'aria-label': 'Close',
+              style: { flexShrink: 0, width: '20px', height: '20px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, borderRadius: '4px', border: 'none', background: 'transparent', color: TXT4, cursor: 'pointer' },
+            },
+            h(
+              'svg',
+              { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' },
+              jsx('path', { d: 'M4 4l8 8' }),
+              jsx('path', { d: 'M12 4l-8 8' })
+            )
+          )
+        : null
+    ),
     h(
       'div',
       { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '6px 6px 6px 10px', borderRadius: '8px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)' } },
       h('textarea', {
         ref,
-        rows: 1,
+        rows: 2,
         value: request,
         onChange: (e) => setRequest(e.target.value),
         onKeyDown: (e) => {
@@ -872,12 +892,11 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
           jsx('path', { d: 'M3.5 7.5 8 3l4.5 4.5' })
         )
       )
-    ),
-    h('div', { style: { marginTop: '6px', color: TXT4, fontSize: '0.6875rem' } }, 'Enter opens a new chat with the request filled in · Shift+Enter for a new line. Nothing is sent until you send it.')
+    )
   )
 }
 
-function ScriptBody({ ctx, profile, script, onSave, ask }) {
+function ScriptBody({ ctx, profile, script, onSave, ask, maxHeight }) {
   const q = useQuery({
     queryKey: [ID, 'script', profile, script],
     queryFn: () => ctx.rest(withProfile('/scripts?path=' + encodeURIComponent(script), profile)),
@@ -891,7 +910,7 @@ function ScriptBody({ ctx, profile, script, onSave, ask }) {
     {},
     h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
     s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes. Too large to edit here.') : null,
-    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask })
+    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask, maxHeight })
   )
 }
 
