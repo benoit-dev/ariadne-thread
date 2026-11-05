@@ -35,7 +35,7 @@ Restart Hermes Desktop, or rescan plugins, so that it loads the Desktop page. Th
 
 Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
 
-- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a step to expand it in place: a script or deterministic step widens to show the script file from `scripts/`, and a prompt step shows the whole prompt. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
+- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a step to expand it in place: a script or deterministic step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step shows where each target in `deliver` resolves (platform, chat and thread, by the scheduler's own rules), or why it sends nothing, such as a platform with no home channel. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
 - **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow. Its steps open the same way.
 - **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. A selected skill has two views: **Workflow** shows its flow, its related skills and the crons that use it, and **SKILL.md** shows the whole file.
 
@@ -50,10 +50,11 @@ An expanded step has an **Edit** button. It turns the step into a text box; **Sa
 - a cron job's prompt.
 - a webhook route's prompt template. Its secret and other fields are kept.
 - a script step's file in `scripts/`, unless it is over 256 KB.
+- a cron job's delivery targets. Pick from local, the origin chat and the platforms your gateway has set up (⚠ marks one with no home channel yet), or type the comma-separated `deliver` value, such as `telegram,discord:1234`. Enter saves.
 
 Scripts show with line numbers and syntax colours (Python, shell and JavaScript, picked by extension or shebang), and edit in a code editor: Tab and Shift+Tab indent or dedent the selected lines, Enter keeps the line's indent (one level more after a Python `:` or an opening bracket), and Backspace in leading spaces removes one indent level.
 
-Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Deliver and trigger steps are read-only.
+Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Trigger steps and webhook deliver steps are read-only.
 
 ### Ask an agent
 

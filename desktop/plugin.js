@@ -48,10 +48,11 @@ const KIND_STYLE = {
 
 const kindStyle = (kind) => KIND_STYLE[kind] || KIND_STYLE.prompt
 
-// What clicking a step expands to show: its script file or its full text. Skill steps get a "Go to skill" button instead.
-const stepAction = (step) => (step.script ? 'script' : step.body ? 'text' : null)
+// What clicking a step expands to show: its script file, a cron's resolved delivery targets, or its full text.
+// Skill steps get a "Go to skill" button instead.
+const stepAction = (step) => (step.script ? 'script' : step.type === 'deliver' && step.job_id ? 'deliver' : step.body ? 'text' : null)
 
-const STEP_TITLE = { script: 'Show script', text: 'Show full text' }
+const STEP_TITLE = { script: 'Show script', deliver: 'Show where it goes', text: 'Show full text' }
 
 const skillTarget = (step) => (step.type === 'skill' && step.name ? step.name : null)
 
@@ -89,6 +90,9 @@ const scriptEdit = (ctx, script, owner) => ({
 
 const cronStepEdit = (ctx, job) => (step) => {
   if (step.script) return scriptEdit(ctx, step.script, 'cron job "' + job.name + '"')
+  if (step.type === 'deliver' && job.id) {
+    return { save: (content, expected) => save(ctx, '/crons/' + encodeURIComponent(job.id) + '/deliver', { expected, content }, 'the delivery of ' + job.name) }
+  }
   if (step.type !== 'prompt' || !job.id) return null
   return {
     save: (content, expected) => save(ctx, '/crons/' + encodeURIComponent(job.id) + '/prompt', { expected, content }, 'the prompt of ' + job.name),
@@ -259,6 +263,8 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
                 { onClick: (e) => e.stopPropagation(), style: { marginTop: '8px', cursor: 'auto' } },
                 step.script
                   ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save, ask, maxHeight: '60vh' })
+                  : action === 'deliver'
+                  ? h(DeliverBody, { ctx, profile, step, onSave: editor && editor.save })
                   : h(TextEditor, { value: step.body, onSave: editor && editor.save, ask, maxHeight: '60vh' })
               )
             : null
@@ -1116,6 +1122,135 @@ function ScriptBody({ ctx, profile, script, onSave, ask, maxHeight }) {
     h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
     s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes. Too large to edit here.') : null,
     h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask, maxHeight, lang: scriptLang(s.path, s.content) })
+  )
+}
+
+const VIA = { origin: 'origin chat', origin_fallback: 'home channel (no origin chat)', home: 'home channel', explicit: '' }
+
+function TargetRow({ entry }) {
+  const mono = { fontFamily: MONO, fontSize: '0.75rem' }
+  const where = (t) =>
+    [t.platform, t.name ? t.name + ' (' + t.chat_id + ')' : t.chat_id || 'own profile', t.thread_id ? 'thread ' + t.thread_id : null].filter(Boolean).join(' · ')
+  return h(
+    'div',
+    { style: { display: 'flex', gap: '8px', alignItems: 'baseline', padding: '4px 0', borderTop: '1px solid ' + STROKE } },
+    h('span', { style: { ...mono, color: TXT2, minWidth: '110px', overflowWrap: 'anywhere' } }, entry.token),
+    h('span', { style: { color: TXT4, fontSize: '0.75rem' } }, '→'),
+    h(
+      'div',
+      { style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 } },
+      entry.targets.length
+        ? entry.targets.map((t, i) =>
+            h(
+              'div',
+              { key: i, style: { fontSize: '0.75rem', color: TXT2, overflowWrap: 'anywhere' } },
+              where(t),
+              VIA[t.via] ? h('span', { style: { color: TXT4 } }, '  · ' + VIA[t.via]) : null
+            )
+          )
+        : h('div', { style: { fontSize: '0.75rem', color: AMBER } }, '⚠ Not sent: ' + entry.error)
+    )
+  )
+}
+
+// A cron's deliver value is a comma list of tokens (local, origin, a platform's home channel, platform:chat).
+// The backend resolves each with the scheduler's own code, so this shows where a run's output really goes.
+function DeliverBody({ ctx, profile, step, onSave }) {
+  const [draft, setDraft] = useState(null)
+  const [err, setErr] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const q = useQuery({
+    queryKey: [ID, 'delivery', profile, step.job_id, step.deliver],
+    queryFn: () => ctx.rest(withProfile('/crons/' + encodeURIComponent(step.job_id) + '/delivery', profile)),
+    refetchInterval: POLL_MS,
+  })
+  const failed = gate(q, 'delivery targets')
+  if (failed) return failed
+  const d = q.data
+  const tokens = (v) => v.split(',').map((t) => t.trim()).filter(Boolean)
+
+  const header = h(
+    'div',
+    { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '6px' } },
+    onSave && draft === null ? h('button', { onClick: () => { setDraft(d.deliver); setErr(null) }, style: smallButton }, '✎ Edit') : null
+  )
+  const view = h(
+    Fragment,
+    {},
+    d.targets.length
+      ? d.targets.map((e, i) => h(TargetRow, { key: i, entry: e }))
+      : h('div', { style: { fontSize: '0.75rem', color: TXT3 } }, 'Local only: the output is saved with the run and not sent anywhere.'),
+    d.failure_deliver
+      ? h(
+          'div',
+          { style: { marginTop: '10px' } },
+          h(SectionLabel, { text: 'Failures go to: ' + d.failure_deliver }),
+          d.failure_targets.map((e, i) => h(TargetRow, { key: i, entry: e }))
+        )
+      : null
+  )
+  if (draft === null) return h(Fragment, {}, header, view)
+
+  const picked = tokens(draft)
+  // "local" means send nowhere, so it replaces every other pick and any other pick replaces it.
+  const toggle = (id) => {
+    if (id === 'local') return setDraft('local')
+    const rest = picked.filter((t) => t !== 'local' && t !== id)
+    setDraft((picked.includes(id) ? rest : rest.concat(id)).join(',') || 'local')
+  }
+  const submit = async () => {
+    setBusy(true)
+    setErr(null)
+    try {
+      await onSave(draft, d.deliver)
+      setDraft(null)
+    } catch (e) {
+      setErr(errorText(e))
+    }
+    setBusy(false)
+  }
+  const unchanged = tokens(draft).join(',') === d.deliver
+  return h(
+    Fragment,
+    {},
+    header,
+    h(
+      'div',
+      { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' } },
+      d.options.map((o) => {
+        const on = picked.includes(o.id)
+        return h(
+          'button',
+          {
+            key: o.id,
+            onClick: () => toggle(o.id),
+            title: o.ready ? o.id : o.id + ': no home channel set yet, so nothing would be sent',
+            style: { ...smallButton, fontSize: '0.6875rem', borderColor: on ? ACCENT : STROKE, background: on ? mix(ACCENT, 14) : 'transparent', color: o.ready ? TXT2 : TXT4 },
+          },
+          (on ? '✓ ' : '') + o.name + (o.ready ? '' : ' ⚠')
+        )
+      })
+    ),
+    h('input', {
+      value: draft,
+      autoFocus: true,
+      spellCheck: false,
+      onChange: (e) => setDraft(e.target.value),
+      onKeyDown: (e) => {
+        if (e.key === 'Escape') setDraft(null)
+        if (e.key === 'Enter') submit()
+      },
+      style: { ...codeBlock, padding: '6px 10px', width: '100%', boxSizing: 'border-box', border: '1px solid ' + ACCENT, outline: 'none' },
+    }),
+    h('div', { style: { marginTop: '4px', fontSize: '0.6875rem', color: TXT4 } }, 'Comma-separated. A platform alone uses its home channel; platform:chat_id (or :chat_id:thread_id) targets one chat.'),
+    err ? h('div', { style: { marginTop: '6px', color: RED, fontSize: '0.75rem' } }, err) : null,
+    h(
+      'div',
+      { style: { marginTop: '6px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' } },
+      h('span', { style: { color: TXT4, fontSize: '0.6875rem', marginRight: 'auto' } }, 'Enter to save · Esc to cancel'),
+      h('button', { onClick: () => setDraft(null), style: smallButton }, 'Cancel'),
+      h('button', { onClick: submit, disabled: busy || unchanged, style: { ...primaryButton(busy || unchanged), padding: '3px 12px', fontSize: '0.75rem' } }, busy ? 'Saving…' : 'Save')
+    )
   )
 }
 
