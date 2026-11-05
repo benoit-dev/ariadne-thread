@@ -13,13 +13,14 @@ import {
   SIDEBAR_NAV_AREA,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs, Fragment } from 'react/jsx-runtime'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useLayoutEffect } from 'react'
 
 const ID = 'ariadne-thread'
 const SKILLS_EVENT = 'plugin.ariadne-thread.skills.changed'
 const POLL_MS = 12000
 const DRAFT_ATTEMPTS = 6
 const DRAFT_RETRY_MS = 250
+const AGENT_BOX_MAX_PX = 240
 
 const TXT1 = 'var(--ui-text-primary, #e5e7eb)'
 const TXT2 = 'var(--ui-text-secondary, #e5e7eb)'
@@ -821,28 +822,58 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
     setBusy(false)
   }
 
+  // The box grows with its text up to AGENT_BOX_MAX_PX, then scrolls.
+  const ref = useRef(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, AGENT_BOX_MAX_PX) + 'px'
+  }, [request])
+
+  const empty = !request.trim()
   return h(
     'div',
     {},
     h('div', { style: { marginBottom: '6px' } }, h(SectionLabel, { text: label || 'Ask an agent to change it' })),
     h(
       'div',
-      { style: { display: 'flex', gap: '8px' } },
-      h('input', {
+      { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '6px 6px 6px 10px', borderRadius: '8px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)' } },
+      h('textarea', {
+        ref,
+        rows: 1,
         value: request,
         onChange: (e) => setRequest(e.target.value),
         onKeyDown: (e) => {
-          if (e.key === 'Enter') submit()
+          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            e.preventDefault()
+            submit()
+          }
           if (e.key === 'Escape' && onClose) onClose()
         },
         autoFocus: !!onClose,
         placeholder,
         disabled: busy,
-        style: { flex: '1', minWidth: 0, padding: '8px 10px', fontSize: '0.8125rem', borderRadius: '6px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
+        style: { flex: '1', minWidth: 0, padding: '4px 0', fontSize: '0.8125rem', lineHeight: '1.45', fontFamily: 'inherit', border: 'none', background: 'transparent', color: 'inherit', outline: 'none', resize: 'none', overflowY: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
       }),
-      h('button', { onClick: submit, disabled: busy, style: primaryButton(busy) }, busy ? 'Opening…' : 'Draft in new chat')
+      h(
+        'button',
+        {
+          onClick: submit,
+          disabled: busy || empty,
+          title: 'Draft in new chat',
+          'aria-label': 'Draft in new chat',
+          style: { flexShrink: 0, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0, borderRadius: '6px', border: 'none', background: empty ? mix(ACCENT, 10) : ACCENT, color: empty ? TXT4 : 'var(--ui-text-on-accent, #fff)', cursor: busy || empty ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 },
+        },
+        h(
+          'svg',
+          { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round' },
+          jsx('path', { d: 'M8 13V3' }),
+          jsx('path', { d: 'M3.5 7.5 8 3l4.5 4.5' })
+        )
+      )
     ),
-    h('div', { style: { marginTop: '6px', color: TXT4, fontSize: '0.6875rem' } }, 'Opens a new chat with the request filled in. Nothing is sent until you send it.')
+    h('div', { style: { marginTop: '6px', color: TXT4, fontSize: '0.6875rem' } }, 'Enter opens a new chat with the request filled in · Shift+Enter for a new line. Nothing is sent until you send it.')
   )
 }
 

@@ -55,7 +55,7 @@ Each save sends the text you started from. If the file changed since (a cron run
 
 ### Ask an agent
 
-Every editable step also has an **Ask agent** button next to **Edit**. It docks a request box at the bottom of the step's visible area that stays in view while you scroll (Esc closes it). The skill has a box for the whole file under its views. Type the request and click **Draft in new chat**. Ariadne's Thread opens a new chat with a prompt that names the file or job, quotes the step's current text, and adds your request. Nothing runs until you send that message. If the draft cannot be placed, the prompt goes to your clipboard.
+Every editable step also has an **Ask agent** button next to **Edit**. It docks a request box at the bottom of the step's visible area that stays in view while you scroll (Esc closes it). The skill has a box for the whole file under its views. Type the request (the box grows to fit it; Shift+Enter adds a line) and press Enter or click the send arrow. Ariadne's Thread opens a new chat with a prompt that names the file or job, quotes the step's current text, and adds your request. Nothing runs until you send that message. If the draft cannot be placed, the prompt goes to your clipboard.
 
 ### How skills become flows
 
