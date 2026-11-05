@@ -258,7 +258,7 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
             h('span', { style: { color: ACCENT, display: 'flex' } }, h(StepIcon, { shapes: st.icon })),
             h('span', { style: { color: ACCENT, fontSize: '0.625rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' } }, st.label),
             sub ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: 'auto' } }, sub) : null,
-            toggleable ? h('span', { style: { color: TXT4, fontSize: '3rem', lineHeight: 1, marginLeft: sub ? '0' : 'auto' } }, expanded ? '▾' : '▸') : null,
+            toggleable ? h('span', { style: { color: TXT4, fontSize: '2rem', lineHeight: 1, marginLeft: sub ? '0' : 'auto' } }, expanded ? '▾' : '▸') : null,
             skill
               ? h(
                   'button',
