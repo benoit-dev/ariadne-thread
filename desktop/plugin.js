@@ -8,7 +8,6 @@ import {
   host,
   haptic,
   useQuery,
-  useMutation,
   queryClient,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
@@ -48,7 +47,7 @@ const KIND_STYLE = {
 
 const kindStyle = (kind) => KIND_STYLE[kind] || KIND_STYLE.prompt
 
-// What clicking a step opens: its script file or its full text. Skill steps get a "Go to skill" button instead.
+// What clicking a step expands to show: its script file or its full text. Skill steps get a "Go to skill" button instead.
 const stepAction = (step) => (step.script ? 'script' : step.body ? 'text' : null)
 
 const STEP_TITLE = { script: 'Show script', text: 'Show full text' }
@@ -68,6 +67,51 @@ const withProfile = (path, profile) =>
   profile && profile !== 'default' ? path + (path.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(profile) : path
 
 const errorText = (e) => (e && e.message) || String(e)
+
+// Edits are only offered on the host's own profile; the backend refuses the others too.
+const canEdit = (profile) => !profile || profile === 'default'
+
+// Every save carries the text the edit started from, so the backend answers 409 instead of
+// overwriting a change made meanwhile by Hermes, an agent, or another window.
+async function save(ctx, path, body, what) {
+  const res = await ctx.rest(path, { method: 'PUT', body })
+  haptic('tap')
+  queryClient.invalidateQueries({ queryKey: [ID] })
+  host.notify({ kind: 'success', message: 'Saved ' + what })
+  return res
+}
+
+const scriptEdit = (ctx, script, owner) => ({
+  save: (content, expected) => save(ctx, '/scripts', { path: script, expected, content }, script),
+  ask: (request) => scriptPrompt(script, owner, request),
+})
+
+const cronStepEdit = (ctx, job) => (step) => {
+  if (step.script) return scriptEdit(ctx, step.script, 'cron job "' + job.name + '"')
+  if (step.type !== 'prompt' || !job.id) return null
+  return {
+    save: (content, expected) => save(ctx, '/crons/' + encodeURIComponent(job.id) + '/prompt', { expected, content }, 'the prompt of ' + job.name),
+    ask: (request) => cronPromptPrompt(job, step.body, request),
+  }
+}
+
+const webhookStepEdit = (ctx, route) => (step) => {
+  if (step.script) return scriptEdit(ctx, step.script, 'webhook route "' + route.name + '"')
+  if (step.type !== 'prompt') return null
+  return {
+    save: (content, expected) => save(ctx, '/webhooks/' + encodeURIComponent(route.name) + '/prompt', { expected, content }, 'the prompt of ' + route.name),
+    ask: (request) => webhookPromptPrompt(route, step.body, request),
+  }
+}
+
+const skillStepEdit = (ctx, detail) => (step) =>
+  step.span
+    ? {
+        save: (content, expected) =>
+          save(ctx, '/skills/' + encodeURIComponent(detail.name) + '/span', { start: step.span[0], end: step.span[1], expected, content }, 'a step of ' + detail.name),
+        ask: (request) => skillStepPrompt(detail, step, request),
+      }
+    : null
 
 const pick = (items, selected) =>
   items.find((i) => i.name === selected) || items[0] || null
@@ -128,15 +172,28 @@ function FlowArrow() {
 }
 
 // The SDK cannot import a graph library, so a chain of node cards stands in for one.
-function Pipeline({ sequence, onStepClick, onOpenSkill }) {
+// Clicking a step expands it in place to show its content; a widened card keeps scripts readable.
+// Skill steps never expand: their "Go to skill" button opens the whole skill instead.
+// edit(step) returns { save(content, expected), ask(request) } for a step the user may change, else null.
+function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
+  const [open, setOpen] = useState(() => new Set())
   if (!sequence || !sequence.length) return h(Note, { text: 'No steps' })
+  const toggle = (i) =>
+    setOpen((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(i)) next.add(i)
+      return next
+    })
   return h(
     'div',
     { style: { display: 'flex', flexDirection: 'column' } },
     sequence.map((step, i) => {
       const st = kindStyle(step.kind || step.type)
-      const action = onStepClick ? stepAction(step) : null
       const skill = onOpenSkill ? skillTarget(step) : null
+      const action = ctx && !skill ? stepAction(step) : null
+      const expanded = action && open.has(i)
+      const editor = expanded && edit ? edit(step) : null
+      const sub = step.kindLabel && step.kindLabel.toLowerCase() !== st.label.toLowerCase() ? step.kindLabel : null
       return h(
         'div',
         { key: i, style: { display: 'flex', flexDirection: 'column' } },
@@ -144,11 +201,12 @@ function Pipeline({ sequence, onStepClick, onOpenSkill }) {
         h(
           'div',
           {
-            onClick: action ? () => onStepClick(step) : undefined,
-            title: action ? STEP_TITLE[action] : undefined,
+            onClick: action ? () => toggle(i) : undefined,
+            title: action ? (expanded ? 'Collapse' : STEP_TITLE[action]) : undefined,
             style: {
               width: '100%',
-              maxWidth: '440px',
+              maxWidth: expanded ? '880px' : '440px',
+              transition: 'max-width 160ms ease',
               margin: '0 auto',
               border: '1px solid ' + mix(st.color, 30),
               borderLeft: '3px solid ' + st.color,
@@ -166,9 +224,8 @@ function Pipeline({ sequence, onStepClick, onOpenSkill }) {
             { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
             h('span', { style: { color: st.color, fontSize: '0.8125rem', lineHeight: '1' } }, st.icon),
             h('span', { style: { color: st.color, fontSize: '0.625rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em' } }, st.label),
-            step.kindLabel && step.kindLabel.toLowerCase() !== st.label.toLowerCase()
-              ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: 'auto' } }, step.kindLabel)
-              : null,
+            sub ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: 'auto' } }, sub) : null,
+            action ? h('span', { style: { color: TXT4, fontSize: '0.625rem', marginLeft: sub ? '0' : 'auto' } }, expanded ? '▾' : '▸') : null,
             skill
               ? h(
                   'button',
@@ -187,8 +244,21 @@ function Pipeline({ sequence, onStepClick, onOpenSkill }) {
           step.label && step.label !== st.label
             ? h('div', { style: { color: TXT2, fontSize: '0.8125rem', fontWeight: 600, overflowWrap: 'break-word' } }, step.label)
             : null,
-          step.detail
+          step.detail && !expanded
             ? h('div', { style: { color: TXT3, fontSize: '0.6875rem', overflowWrap: 'break-word', maxHeight: '3.2em', overflow: 'hidden' } }, String(step.detail))
+            : null,
+          expanded
+            ? h(
+                'div',
+                // Clicks inside the content (selecting, scrolling) must not collapse the card.
+                { onClick: (e) => e.stopPropagation(), style: { marginTop: '8px', maxHeight: '60vh', overflowY: 'auto', cursor: 'auto' } },
+                step.script
+                  ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save })
+                  : h(TextEditor, { value: step.body, onSave: editor && editor.save }),
+                editor && editor.ask
+                  ? h('div', { style: { marginTop: '10px' } }, h(AgentBox, { ctx, buildPrompt: editor.ask, placeholder: 'e.g. make this step also check…' }))
+                  : null
+              )
             : null
         )
       )
@@ -231,7 +301,7 @@ function ListRow({ active, onClick, children }) {
   )
 }
 
-function CronsTab({ ctx, profile, nav, onOpenStep, onOpenSkill }) {
+function CronsTab({ ctx, profile, nav, onOpenSkill }) {
   const [selected, setSelected] = useState(null)
   const q = useQuery({
     queryKey: [ID, 'crons', profile],
@@ -278,11 +348,11 @@ function CronsTab({ ctx, profile, nav, onOpenStep, onOpenSkill }) {
     job.issues && job.issues.length
       ? h('div', { style: { marginTop: '8px' } }, job.issues.map((iss, i) => h('div', { key: i, style: { color: AMBER, fontSize: '0.75rem' } }, '⚠ ' + iss)))
       : null,
-    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { sequence: job.sequence, onStepClick: onOpenStep, onOpenSkill: (name) => onOpenSkill(name, { to: 'crons', item: job.name, kind: 'cron' }) }))
+    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { key: job.name, sequence: job.sequence, ctx, profile, edit: canEdit(profile) ? cronStepEdit(ctx, job) : null, onOpenSkill: (name) => onOpenSkill(name, { to: 'crons', item: job.name, kind: 'cron' }) }))
   )
 }
 
-function WebhooksTab({ ctx, profile, nav, onOpenStep, onOpenSkill }) {
+function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
   const [selected, setSelected] = useState(null)
   const q = useQuery({
     queryKey: [ID, 'webhooks', profile],
@@ -317,43 +387,7 @@ function WebhooksTab({ ctx, profile, nav, onOpenStep, onOpenSkill }) {
     route.events && route.events.length
       ? h('div', { style: { marginTop: '8px', display: 'flex', gap: '4px', flexWrap: 'wrap' } }, route.events.map((e) => h(Badge, { key: e }, e)))
       : h('div', { style: { marginTop: '8px' } }, h(Badge, {}, 'all events')),
-    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { sequence: route.sequence, onStepClick: onOpenStep, onOpenSkill: (name) => onOpenSkill(name, { to: 'webhooks', item: route.name, kind: 'webhook' }) }))
-  )
-}
-
-function useEscape(ctx, onEscape) {
-  useEffect(() => {
-    const onKey = (e) => {
-      if (e.key === 'Escape') onEscape()
-    }
-    return ctx.addEventListener(window, 'keydown', onKey)
-  }, [ctx, onEscape])
-}
-
-function Overlay({ onClose, children }) {
-  return h(
-    'div',
-    {
-      onClick: (e) => {
-        if (e.target === e.currentTarget) onClose()
-      },
-      style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.22)', backdropFilter: 'blur(0.125rem)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 'var(--z-modal, 130)', padding: '24px' },
-    },
-    children
-  )
-}
-
-function Dialog({ title, onClose, children }) {
-  return h(
-    'div',
-    { style: { width: '100%', maxWidth: '720px', height: '80vh', display: 'flex', flexDirection: 'column', borderRadius: '10px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-card, var(--ui-bg-chrome, #1a1c1f))', color: TXT1, boxShadow: '0 10px 40px rgba(0,0,0,0.4)' } },
-    h(
-      'div',
-      { style: { padding: '12px 16px', borderBottom: '1px solid ' + STROKE, display: 'flex', alignItems: 'center', justifyContent: 'space-between' } },
-      h('div', { style: { fontWeight: 600, fontSize: '0.875rem', color: TXT1 } }, title),
-      h('button', { onClick: onClose, 'aria-label': 'Close', style: { background: 'transparent', border: 'none', color: TXT3, cursor: 'pointer', fontSize: '1rem' } }, '✕')
-    ),
-    children
+    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { key: route.name, sequence: route.sequence, ctx, profile, edit: canEdit(profile) ? webhookStepEdit(ctx, route) : null, onOpenSkill: (name) => onOpenSkill(name, { to: 'webhooks', item: route.name, kind: 'webhook' }) }))
   )
 }
 
@@ -367,6 +401,8 @@ const outlineButton = {
   fontSize: '0.8125rem',
 }
 
+const smallButton = { ...outlineButton, padding: '3px 10px', fontSize: '0.75rem' }
+
 const primaryButton = (disabled) => ({
   padding: '6px 14px',
   borderRadius: '6px',
@@ -379,67 +415,71 @@ const primaryButton = (disabled) => ({
   whiteSpace: 'nowrap',
 })
 
-function EditDialog({ skill, ctx, profile, onClose }) {
-  const [content, setContent] = useState(skill.raw)
+const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO }
+
+// Shows text, and with onSave an Edit button that swaps it for a textarea in place.
+// The text at the moment Edit is clicked is what the save claims to replace, so polling can refresh
+// `value` underneath an open editor without losing the draft or hiding a concurrent change.
+function TextEditor({ value, onSave, hint }) {
+  const [draft, setDraft] = useState(null)
+  const [base, setBase] = useState('')
   const [err, setErr] = useState(null)
-  useEscape(ctx, onClose)
+  const [busy, setBusy] = useState(false)
 
-  const mutation = useMutation({
-    mutationFn: (next) =>
-      ctx.rest(withProfile('/skills/' + encodeURIComponent(skill.name), profile), { method: 'PUT', body: { content: next } }),
-    onSuccess: () => {
-      haptic('tap')
-      queryClient.invalidateQueries({ queryKey: [ID, 'skills'] })
-      queryClient.invalidateQueries({ queryKey: [ID, 'skill'] })
-      host.notify({ kind: 'success', message: 'Skill saved: ' + skill.name })
-      onClose()
-    },
-    onError: (e) => setErr(errorText(e)),
-  })
+  if (draft === null) {
+    return h(
+      Fragment,
+      {},
+      onSave
+        ? h(
+            'div',
+            { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '6px' } },
+            h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null) }, style: smallButton }, '✎ Edit')
+          )
+        : null,
+      h('pre', { style: codeBlock }, value)
+    )
+  }
 
+  const submit = async () => {
+    setBusy(true)
+    setErr(null)
+    try {
+      await onSave(draft, base)
+      setDraft(null)
+    } catch (e) {
+      setErr(errorText(e))
+    }
+    setBusy(false)
+  }
   return h(
-    Overlay,
-    { onClose },
+    Fragment,
+    {},
+    hint ? h('div', { style: { marginBottom: '6px', fontSize: '0.6875rem', color: TXT4 } }, hint) : null,
+    h('textarea', {
+      value: draft,
+      autoFocus: true,
+      onChange: (e) => setDraft(e.target.value),
+      onKeyDown: (e) => {
+        if (e.key === 'Escape') setDraft(null)
+        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit()
+      },
+      spellCheck: false,
+      rows: Math.min(30, Math.max(6, draft.split('\n').length + 1)),
+      style: { ...codeBlock, width: '100%', boxSizing: 'border-box', resize: 'vertical', border: '1px solid ' + ACCENT, outline: 'none', whiteSpace: 'pre', overflowX: 'auto' },
+    }),
+    err ? h('div', { style: { marginTop: '6px', color: RED, fontSize: '0.75rem' } }, err) : null,
     h(
-      Dialog,
-      { title: 'Edit skill: ' + skill.name, onClose },
-      h('div', { style: { padding: '8px 16px', fontSize: '0.6875rem', color: TXT4 } }, 'Full SKILL.md: YAML frontmatter (--- … ---) then the markdown body. Validated on save.'),
-      h('textarea', {
-        value: content,
-        onChange: (e) => {
-          setContent(e.target.value)
-          setErr(null)
-        },
-        spellCheck: false,
-        style: {
-          flex: '1',
-          margin: '0 16px',
-          padding: '12px',
-          resize: 'none',
-          fontFamily: MONO,
-          fontSize: '0.75rem',
-          lineHeight: '1.5',
-          borderRadius: '8px',
-          border: '1px solid ' + STROKE,
-          background: 'var(--ui-bg-input, transparent)',
-          color: 'inherit',
-          outline: 'none',
-          whiteSpace: 'pre',
-          overflowX: 'auto',
-        },
-      }),
-      err ? h('div', { style: { margin: '8px 16px', color: RED, fontSize: '0.75rem' } }, err) : null,
-      h(
-        'div',
-        { style: { padding: '12px 16px', display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
-        h('button', { onClick: onClose, style: outlineButton }, 'Cancel'),
-        h('button', { onClick: () => mutation.mutate(content), disabled: mutation.isPending, style: primaryButton(mutation.isPending) }, mutation.isPending ? 'Saving…' : 'Save')
-      )
+      'div',
+      { style: { marginTop: '6px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' } },
+      h('span', { style: { color: TXT4, fontSize: '0.6875rem', marginRight: 'auto' } }, '⌘/Ctrl+Enter to save · Esc to cancel'),
+      h('button', { onClick: () => setDraft(null), style: smallButton }, 'Cancel'),
+      h('button', { onClick: submit, disabled: busy || draft === base, style: { ...primaryButton(busy || draft === base), padding: '3px 12px', fontSize: '0.75rem' } }, busy ? 'Saving…' : 'Save')
     )
   )
 }
 
-function FlowSection({ flow, onStepClick, onOpenSkill }) {
+function FlowSection({ flow, ctx, profile, onOpenSkill, edit }) {
   if (!flow) return null
   const note = !flow.fallback
     ? 'Parsed via ' + flow.strategy
@@ -449,9 +489,8 @@ function FlowSection({ flow, onStepClick, onOpenSkill }) {
   return h(
     'div',
     { style: { marginTop: '16px' } },
-    h(SectionLabel, { text: 'Flow' }),
-    h('div', { style: { color: TXT4, fontSize: '0.6875rem', marginTop: '2px' } }, note),
-    h('div', { style: { marginTop: '8px' } }, h(Pipeline, { sequence: flow.steps, onStepClick, onOpenSkill }))
+    h('div', { style: { color: TXT4, fontSize: '0.6875rem' } }, note),
+    h('div', { style: { marginTop: '8px' } }, h(Pipeline, { sequence: flow.steps, ctx, profile, onOpenSkill, edit }))
   )
 }
 
@@ -479,7 +518,14 @@ function ChipList({ label, items, tone, onPick }) {
   )
 }
 
-function SkillDetail({ detail, onEdit, onSwitch, onCron, onOpenStep }) {
+
+const SKILL_VIEWS = [
+  { id: 'workflow', label: 'Workflow' },
+  { id: 'md', label: 'SKILL.md' },
+]
+
+function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron }) {
+  const editable = detail.editable && canEdit(profile)
   return h(
     Fragment,
     {},
@@ -489,21 +535,36 @@ function SkillDetail({ detail, onEdit, onSwitch, onCron, onOpenStep }) {
       h('div', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, detail.name),
       detail.category ? h(Badge, {}, detail.category) : null,
       detail.source === 'external' ? h(Badge, {}, 'external') : !detail.editable ? h(Badge, {}, 'read-only') : null,
-      onEdit && detail.editable
-        ? h('button', { onClick: onEdit, style: { ...outlineButton, marginLeft: 'auto', padding: '4px 10px', fontSize: '0.75rem' } }, '✎ Edit')
-        : null
+      h('div', { style: { marginLeft: 'auto' } }, h(TabBar, { tabs: SKILL_VIEWS, tab: view, onTab: onView }))
     ),
     detail.description ? h('div', { style: { marginTop: '8px', color: TXT3, fontSize: '0.8125rem' } }, detail.description) : null,
-    h(FlowSection, {
-      flow: detail.flow,
-      onStepClick: onOpenStep,
-      onOpenSkill: onSwitch,
-    }),
-    h(ChipList, { label: 'Credentials', items: detail.credentials, tone: 'accent' }),
-    h(ChipList, { label: 'Related skills', items: detail.related_skills, onPick: onSwitch }),
-    h(ChipList, { label: 'Used by crons', items: detail.used_by_crons, onPick: onCron }),
-    h('div', { style: { marginTop: '16px' } }, h(SectionLabel, { text: 'SKILL.md' })),
-    h('pre', { style: { marginTop: '8px', padding: '12px', borderRadius: '8px', background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO } }, detail.raw)
+    view === 'md'
+      ? h(
+          'div',
+          { key: 'md', style: { marginTop: '16px' } },
+          h(TextEditor, {
+            value: detail.raw,
+            hint: 'Full SKILL.md: YAML frontmatter (--- … ---) then the markdown body. Validated on save.',
+            onSave: editable
+              ? (content, expected) => save(ctx, '/skills/' + encodeURIComponent(detail.name), { content, expected }, detail.name)
+              : null,
+          })
+        )
+      : h(
+          Fragment,
+          {},
+          h(FlowSection, {
+            key: detail.name,
+            flow: detail.flow,
+            ctx,
+            profile,
+            onOpenSkill: onSwitch,
+            edit: editable ? skillStepEdit(ctx, detail) : null,
+          }),
+          h(ChipList, { label: 'Credentials', items: detail.credentials, tone: 'accent' }),
+          h(ChipList, { label: 'Related skills', items: detail.related_skills, onPick: onSwitch }),
+          h(ChipList, { label: 'Used by crons', items: detail.used_by_crons, onPick: onCron })
+        )
   )
 }
 
@@ -546,10 +607,12 @@ function BackBar({ from, onBack }) {
   )
 }
 
-function SkillsTab({ ctx, profile, nav, onNavigate, onOpenStep }) {
+
+function SkillsTab({ ctx, profile, nav, onNavigate }) {
   const [selected, setSelected] = useState(null)
   const [filter, setFilter] = useState('')
-  const [editing, setEditing] = useState(false)
+  // Workflow or SKILL.md; kept while moving between skills.
+  const [view, setView] = useState('workflow')
   const q = useQuery({
     queryKey: [ID, 'skills', profile],
     queryFn: () => ctx.rest(withProfile('/skills', profile)),
@@ -610,34 +673,89 @@ function SkillsTab({ ctx, profile, nav, onNavigate, onOpenStep }) {
           (detail.data
             ? h(SkillDetail, {
                 detail: detail.data,
-                onEdit: () => setEditing(true),
+                view,
+                onView: setView,
                 onSwitch: open,
                 onCron: (cron) => onNavigate('crons', cron),
-                onOpenStep,
+                ctx,
+                profile,
               })
             : null)
       : h(Note, { text: 'Select a skill' }),
-    detail.data && detail.data.editable
-      ? h('div', { style: { margin: '16px -16px -16px' } }, h(DraftBox, { key: detail.data.name, ctx, detail: detail.data, onDone: () => {} }))
-      : null,
-    editing && detail.data ? h(EditDialog, { skill: detail.data, ctx, profile, onClose: () => setEditing(false) }) : null
+    detail.data && detail.data.editable && canEdit(profile)
+      ? h(
+          'div',
+          { style: { margin: '16px -16px -16px', padding: '12px 16px', borderTop: '1px solid ' + STROKE } },
+          h(AgentBox, {
+            key: detail.data.name,
+            ctx,
+            buildPrompt: (request) => skillPrompt(detail.data, request),
+            placeholder: 'e.g. reword the description, add a pitfall, restructure…',
+          })
+        )
+      : null
   )
 }
 
-function buildChangePrompt(detail, request) {
-  return [
-    'Please update the Hermes skill "' + detail.name + '".',
-    '',
-    'Skill file: ' + detail.path,
-    '',
-    'Requested change:',
-    request,
-    '',
-    'Edit that file in place and keep the frontmatter valid: it must start with --- on the first line, ' +
-      'include name and description (description at most 1024 characters), and be followed by a non-empty body. ' +
-      'When you are done, summarize what you changed.',
-  ].join('\n')
+
+const fenced = (text) => ['~~~~', text, '~~~~'].join('\n')
+
+function changePrompt(lines, request) {
+  return [...lines, '', 'Requested change:', request, '', 'When you are done, summarize what you changed.'].join('\n')
 }
+
+const FRONTMATTER_RULE =
+  'Keep the frontmatter valid: it must start with --- on the first line, include name and description ' +
+  '(description at most 1024 characters), and be followed by a non-empty body.'
+
+const skillPrompt = (detail, request) =>
+  changePrompt(['Please update the Hermes skill "' + detail.name + '".', '', 'Skill file: ' + detail.path, '', 'Edit that file in place. ' + FRONTMATTER_RULE], request)
+
+const skillStepPrompt = (detail, step, request) =>
+  changePrompt(
+    [
+      'Please update one step of the Hermes skill "' + detail.name + '".',
+      '',
+      'Skill file: ' + detail.path,
+      'Step: ' + (step.label || '(unnamed)'),
+      'Its current text in that file:',
+      fenced(step.body),
+      '',
+      'Change only that part of the file, in place. ' + FRONTMATTER_RULE,
+    ],
+    request
+  )
+
+const cronPromptPrompt = (job, current, request) =>
+  changePrompt(
+    [
+      'Please update the prompt of the Hermes cron job "' + job.name + '" (id ' + job.id + ').',
+      'Use the cronjob tool to update it; do not edit cron/jobs.json by hand.',
+      '',
+      'Current prompt:',
+      fenced(current),
+    ],
+    request
+  )
+
+const webhookPromptPrompt = (route, current, request) =>
+  changePrompt(
+    [
+      'Please update the prompt template of the Hermes webhook route "' + route.name + '".',
+      'Leave its secret and every other field unchanged.',
+      '',
+      'Current prompt template:',
+      fenced(current),
+    ],
+    request
+  )
+
+const scriptPrompt = (script, owner, request) =>
+  changePrompt(
+    ['Please update the script "' + script + '" in the Hermes scripts folder. The ' + owner + ' runs it.', 'Edit the file in place and keep it runnable.'],
+    request
+  )
+
 
 // The new-chat composer mounts asynchronously after the navigation, so setDraft is retried.
 async function draftInNewChat(ctx, text) {
@@ -653,7 +771,10 @@ async function draftInNewChat(ctx, text) {
   return false
 }
 
-function DraftBox({ ctx, detail, onDone }) {
+
+// One request box for an agent: the skill as a whole at the bottom of the Skills tab, or one step
+// inside its expanded card. buildPrompt(request) gives the full prompt for the new chat.
+function AgentBox({ ctx, buildPrompt, label, placeholder }) {
   const [request, setRequest] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -661,11 +782,10 @@ function DraftBox({ ctx, detail, onDone }) {
     const text = request.trim()
     if (!text || busy) return
     setBusy(true)
-    const prompt = buildChangePrompt(detail, text)
+    const prompt = buildPrompt(text)
     if (await draftInNewChat(ctx, prompt)) {
       haptic('tap')
       host.notify({ kind: 'info', message: 'Draft ready in a new chat. Review it, then send.' })
-      onDone()
       return
     }
     const copied = await ctx.os.writeClipboard(prompt)
@@ -679,8 +799,8 @@ function DraftBox({ ctx, detail, onDone }) {
 
   return h(
     'div',
-    { style: { padding: '12px 16px', borderTop: '1px solid ' + STROKE } },
-    h('div', { style: { marginBottom: '6px' } }, h(SectionLabel, { text: 'Ask an agent to change it' })),
+    {},
+    h('div', { style: { marginBottom: '6px' } }, h(SectionLabel, { text: label || 'Ask an agent to change it' })),
     h(
       'div',
       { style: { display: 'flex', gap: '8px' } },
@@ -690,9 +810,9 @@ function DraftBox({ ctx, detail, onDone }) {
         onKeyDown: (e) => {
           if (e.key === 'Enter') submit()
         },
-        placeholder: 'e.g. reword the description, add a pitfall, restructure…',
+        placeholder,
         disabled: busy,
-        style: { flex: '1', padding: '8px 10px', fontSize: '0.8125rem', borderRadius: '6px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
+        style: { flex: '1', minWidth: 0, padding: '8px 10px', fontSize: '0.8125rem', borderRadius: '6px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
       }),
       h('button', { onClick: submit, disabled: busy, style: primaryButton(busy) }, busy ? 'Opening…' : 'Draft in new chat')
     ),
@@ -700,9 +820,7 @@ function DraftBox({ ctx, detail, onDone }) {
   )
 }
 
-const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO }
-
-function ScriptBody({ ctx, profile, script }) {
+function ScriptBody({ ctx, profile, script, onSave }) {
   const q = useQuery({
     queryKey: [ID, 'script', profile, script],
     queryFn: () => ctx.rest(withProfile('/scripts?path=' + encodeURIComponent(script), profile)),
@@ -715,26 +833,8 @@ function ScriptBody({ ctx, profile, script }) {
     Fragment,
     {},
     h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
-    s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes.') : null,
-    h('pre', { style: codeBlock }, s.content)
-  )
-}
-
-function StepModal({ step, ctx, profile, onClose }) {
-  useEscape(ctx, onClose)
-  const st = kindStyle(step.kind || step.type)
-  return h(
-    Overlay,
-    { onClose },
-    h(
-      Dialog,
-      { title: st.label + ': ' + (step.label || step.name || ''), onClose },
-      h(
-        'div',
-        { style: { flex: '1', minHeight: 0, overflowY: 'auto', padding: '16px' } },
-        step.script ? h(ScriptBody, { ctx, profile, script: step.script }) : h('pre', { style: codeBlock }, step.body)
-      )
-    )
+    s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes. Too large to edit here.') : null,
+    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave })
   )
 }
 
@@ -744,11 +844,11 @@ const TABS = [
   { id: 'skills', label: 'Skills' },
 ]
 
-function TabBar({ tab, onTab }) {
+function TabBar({ tabs, tab, onTab }) {
   return h(
     'div',
-    { style: { display: 'flex', gap: '2px', marginLeft: '8px' } },
-    TABS.map((t) =>
+    { style: { display: 'flex', gap: '2px' } },
+    tabs.map((t) =>
       h(
         'button',
         {
@@ -795,7 +895,6 @@ function AriadnePage({ ctx }) {
   const [profile, setProfile] = useState('default')
   // A badge click can jump to another tab and select an item there: { to, item }.
   const [nav, setNav] = useState(null)
-  const [modalStep, setModalStep] = useState(null)
 
   // from: the cron or webhook a "Go to skill" click left, so the skill page can lead back to it.
   const navigate = (to, item, from) => {
@@ -827,6 +926,7 @@ function AriadnePage({ ctx }) {
       { style: { display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 12px', borderBottom: '1px solid ' + STROKE } },
       h('div', { style: { fontWeight: 600, fontSize: '0.875rem', color: TXT2 } }, "Ariadne's Thread"),
       h(TabBar, {
+        tabs: TABS,
         tab,
         onTab: (id) => {
           setNav(null)
@@ -837,8 +937,7 @@ function AriadnePage({ ctx }) {
       h(ProfileSelect, { ctx, profile, onChange: setProfile })
     ),
     // Keyed by profile so a selection from one profile never leaks into another.
-    h('div', { style: { flex: '1', minHeight: 0 } }, h(Active, { key: profile, ctx, profile, nav, onOpenStep: setModalStep, onOpenSkill: (name, from) => navigate('skills', name, from), onNavigate: navigate })),
-    modalStep ? h(StepModal, { step: modalStep, ctx, profile, onClose: () => setModalStep(null) }) : null
+    h('div', { style: { flex: '1', minHeight: 0 } }, h(Active, { key: profile, ctx, profile, nav, onOpenSkill: (name, from) => navigate('skills', name, from), onNavigate: navigate }))
   )
 }
 

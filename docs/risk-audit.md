@@ -37,7 +37,16 @@ Reads stay inside Hermes's own home, plus any skill folders that the user lists 
 
 | Location | Writes | Guard |
 |---|---|---|
-| `dashboard/plugin_api.py:960-970` | One `SKILL.md` that the user edited, by temp file and rename in the same folder | Active profile only. Skills from external folders are read-only. The real path must be inside `<home>/skills/`. The content must pass the same frontmatter checks as Hermes's skill manager. |
+| `dashboard/plugin_api.py:1040`, `:1073` (through `_atomic_write` at `:976`) | One `SKILL.md` that the user edited, whole or the lines of one flow step, by temp file and rename in the same folder | Active profile only. Skills from external folders are read-only. The real path must be inside `<home>/skills/`. The resulting file must pass the same frontmatter checks as Hermes's skill manager. |
+| `dashboard/plugin_api.py:1143` | One script under `<home>/scripts/` that the user edited, by temp file and rename, keeping its mode | Active profile only. Same path rules as the script read: anything resolving outside `<home>/scripts/` gets HTTP 403. Scripts over 256 KB or not UTF-8 are refused. |
+| `dashboard/plugin_api.py:1173` | The `prompt` of one cron job, through `cron.jobs.update_job` | Active profile only. Hermes takes its cron store lock, so the write cannot interleave with the scheduler. |
+| `dashboard/plugin_api.py:1192` | The `prompt` of one webhook route, through `hermes_cli.webhook._replace_subscription` | Active profile only. Hermes takes its subscriptions lock and compares the whole route, so a concurrent change is refused. The secret is copied through unchanged and never returned. |
+
+Every write carries the text the user started editing from and is refused with HTTP 409 if the file no longer matches. Nothing is written without a **Save** click.
+
+#### Core imports
+
+Hermes has no public seam for editing a cron job's prompt (`cron.manage` lists, adds, removes, pauses and resumes only) or a webhook route. The cron and webhook writes therefore import `cron.jobs` and private functions of `hermes_cli.webhook`. `hermes plugins validate` passes and lists these as rule 9 warnings. If a later Hermes drops the webhook functions, that endpoint answers HTTP 501 and the UI shows the error; reads are unaffected.
 
 ### Network
 
