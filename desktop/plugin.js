@@ -193,6 +193,7 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
       const action = ctx && !skill ? stepAction(step) : null
       const expanded = action && open.has(i)
       const editor = expanded && edit ? edit(step) : null
+      const ask = editor && editor.ask ? (close) => h(AgentBox, { ctx, buildPrompt: editor.ask, onClose: close, placeholder: 'e.g. make this step also check…' }) : null
       const sub = step.kindLabel && step.kindLabel.toLowerCase() !== st.label.toLowerCase() ? step.kindLabel : null
       return h(
         'div',
@@ -253,11 +254,8 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
                 // Clicks inside the content (selecting, scrolling) must not collapse the card.
                 { onClick: (e) => e.stopPropagation(), style: { marginTop: '8px', maxHeight: '60vh', overflowY: 'auto', cursor: 'auto' } },
                 step.script
-                  ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save })
-                  : h(TextEditor, { value: step.body, onSave: editor && editor.save }),
-                editor && editor.ask
-                  ? h('div', { style: { marginTop: '10px' } }, h(AgentBox, { ctx, buildPrompt: editor.ask, placeholder: 'e.g. make this step also check…' }))
-                  : null
+                  ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save, ask })
+                  : h(TextEditor, { value: step.body, onSave: editor && editor.save, ask })
               )
             : null
         )
@@ -420,24 +418,49 @@ const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background:
 // Shows text, and with onSave an Edit button that swaps it for a textarea in place.
 // The text at the moment Edit is clicked is what the save claims to replace, so polling can refresh
 // `value` underneath an open editor without losing the draft or hiding a concurrent change.
-function TextEditor({ value, onSave, hint }) {
+// ask(close), when given, adds an "Ask agent" button that opens the returned box docked under the text.
+// The box sticks to the bottom of a scrolling parent, so on a long step it stays in view over the text.
+function TextEditor({ value, onSave, hint, ask }) {
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState('')
   const [err, setErr] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [asking, setAsking] = useState(false)
 
   if (draft === null) {
     return h(
       Fragment,
       {},
-      onSave
+      onSave || ask
         ? h(
             'div',
-            { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '6px' } },
-            h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null) }, style: smallButton }, '✎ Edit')
+            { style: { display: 'flex', justifyContent: 'flex-end', gap: '6px', marginBottom: '6px' } },
+            ask
+              ? h('button', { onClick: () => setAsking(!asking), style: asking ? { ...smallButton, borderColor: ACCENT, color: TXT1 } : smallButton }, '✦ Ask agent')
+              : null,
+            onSave ? h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null); setAsking(false) }, style: smallButton }, '✎ Edit') : null
           )
         : null,
-      h('pre', { style: codeBlock }, value)
+      h('pre', { style: codeBlock }, value),
+      ask && asking
+        ? h(
+            'div',
+            {
+              style: {
+                position: 'sticky',
+                bottom: 0,
+                zIndex: 1,
+                marginTop: '8px',
+                padding: '8px 10px 10px',
+                borderRadius: '8px',
+                border: '1px solid ' + STROKE,
+                background: 'var(--ui-bg-elevated, #1f2937)',
+                boxShadow: '0 -6px 16px rgba(0,0,0,0.12)',
+              },
+            },
+            ask(() => setAsking(false))
+          )
+        : null
     )
   }
 
@@ -774,7 +797,8 @@ async function draftInNewChat(ctx, text) {
 
 // One request box for an agent: the skill as a whole at the bottom of the Skills tab, or one step
 // inside its expanded card. buildPrompt(request) gives the full prompt for the new chat.
-function AgentBox({ ctx, buildPrompt, label, placeholder }) {
+// onClose, when given, makes the box dismissable: it takes focus on open and Esc closes it.
+function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
   const [request, setRequest] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -809,7 +833,9 @@ function AgentBox({ ctx, buildPrompt, label, placeholder }) {
         onChange: (e) => setRequest(e.target.value),
         onKeyDown: (e) => {
           if (e.key === 'Enter') submit()
+          if (e.key === 'Escape' && onClose) onClose()
         },
+        autoFocus: !!onClose,
         placeholder,
         disabled: busy,
         style: { flex: '1', minWidth: 0, padding: '8px 10px', fontSize: '0.8125rem', borderRadius: '6px', border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
@@ -820,7 +846,7 @@ function AgentBox({ ctx, buildPrompt, label, placeholder }) {
   )
 }
 
-function ScriptBody({ ctx, profile, script, onSave }) {
+function ScriptBody({ ctx, profile, script, onSave, ask }) {
   const q = useQuery({
     queryKey: [ID, 'script', profile, script],
     queryFn: () => ctx.rest(withProfile('/scripts?path=' + encodeURIComponent(script), profile)),
@@ -834,7 +860,7 @@ function ScriptBody({ ctx, profile, script, onSave }) {
     {},
     h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
     s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes. Too large to edit here.') : null,
-    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave })
+    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask })
   )
 }
 
