@@ -740,9 +740,9 @@ def test_script_steps_name_the_script_and_prompts_carry_their_full_text(client, 
 
     jobs = {j["name"]: j for j in client.get("/crons").json()["jobs"]}
 
-    (snap,) = jobs["snap"]["sequence"]
+    snap, _ = jobs["snap"]["sequence"]
     assert (snap["kind"], snap["script"]) == ("deterministic", "snapshot.py")
-    script, prompt = jobs["gate"]["sequence"]
+    script, prompt, _ = jobs["gate"]["sequence"]
     assert (script["kind"], script["script"]) == ("script", "gate.sh")
     assert prompt["body"] == long_prompt and len(prompt["detail"]) == 80
 
@@ -881,6 +881,62 @@ def test_a_cron_prompt_is_saved_through_the_hermes_cron_store(client, home):
     assert saved.status_code == 200, saved.text
     assert cron_jobs.get_job(job["id"])["prompt"] == "New prompt"
     assert client.put("/crons/missing/prompt", json={"expected": "", "content": "x"}).status_code == 404
+
+
+def test_every_cron_ends_in_a_deliver_step_even_when_it_only_saves(client, home):
+    write_json(
+        home / "cron" / "jobs.json",
+        {"jobs": [
+            {"id": "a", "name": "quiet", "prompt": "x"},
+            {"id": "b", "name": "loud", "prompt": "x", "deliver": ["telegram", "discord:123"], "failure_deliver": "local"},
+        ]},
+    )
+
+    jobs = {j["name"]: j for j in client.get("/crons").json()["jobs"]}
+
+    quiet, loud = jobs["quiet"]["sequence"][-1], jobs["loud"]["sequence"][-1]
+    assert (quiet["type"], quiet["deliver"], quiet["job_id"]) == ("deliver", "local", "a")
+    assert quiet["detail"] == "Output is saved, not sent"
+    assert loud["deliver"] == loud["label"] == jobs["loud"]["deliver"] == "telegram,discord:123"
+    assert loud["detail"] == "failures \u2192 local"
+
+
+def test_delivery_resolves_each_target_the_way_the_scheduler_does(client, home, monkeypatch):
+    pytest.importorskip("cron.scheduler_delivery")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "777")
+    write_json(home / "channel_directory.json", {"platforms": {"telegram": [{"id": "777", "name": "Ops room"}]}})
+    write_json(
+        home / "cron" / "jobs.json",
+        {"jobs": [{
+            "id": "j1", "name": "n", "prompt": "x", "deliver": "origin,telegram,nowhere,local",
+            "origin": {"platform": "discord", "chat_id": "55", "chat_name": "General"},
+        }]},
+    )
+
+    body = client.get("/crons/j1/delivery").json()
+
+    origin, tg, bad = body["targets"]
+    assert origin["targets"] == [{"platform": "discord", "chat_id": "55", "name": "General", "via": "origin", "thread_id": None}]
+    assert tg["targets"][0]["chat_id"] == "777" and tg["targets"][0]["name"] == "Ops room"
+    assert bad["token"] == "nowhere" and not bad["targets"] and "not a delivery platform" in bad["error"]
+    assert [o["id"] for o in body["options"]][:2] == ["local", "origin"]
+    assert client.get("/crons/missing/delivery").status_code == 404
+
+
+def test_a_cron_delivery_target_is_saved_through_the_hermes_cron_store(client, home):
+    cron_jobs = pytest.importorskip("cron.jobs")
+    job = cron_jobs.create_job(prompt="p", schedule="every 1h", name="hourly", deliver="local")
+    path = f"/crons/{job['id']}/deliver"
+
+    stale = client.put(path, json={"expected": "telegram", "content": "discord"})
+    saved = client.put(path, json={"expected": "local", "content": " local, telegram ,discord:9,telegram,"})
+
+    assert stale.status_code == 409
+    assert saved.status_code == 200, saved.text
+    assert cron_jobs.get_job(job["id"])["deliver"] == "telegram,discord:9"
+    cleared = client.put(path, json={"expected": "telegram,discord:9", "content": "  "})
+    assert cleared.json()["deliver"] == cron_jobs.get_job(job["id"])["deliver"] == "local"
+    assert client.put(path + "?profile=other", json={"expected": "local", "content": "x"}).status_code in (403, 404)
 
 
 def test_a_webhook_prompt_is_saved_and_the_secret_is_kept(client, home):

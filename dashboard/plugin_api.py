@@ -33,6 +33,7 @@ import re
 import stat
 import tempfile
 from bisect import bisect_right
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
@@ -691,12 +692,25 @@ def _cron_sequence(j: dict, skills: list[str]) -> list[dict]:
             {"type": "skill", "kind": "skill", "kindLabel": "skill",
              "label": s, "name": s}
         )
-    if j.get("deliver") and j.get("deliver") != "local":
-        sequence.append(
-            {"type": "deliver", "kind": "deliver", "kindLabel": j["deliver"],
-             "label": j["deliver"]}
-        )
+    sequence.append(_cron_deliver_step(j))
     return sequence
+
+
+def _deliver_text(value, default: str = "local") -> str:
+    """A job's ``deliver`` as Hermes reads it: comma-separated, lists flattened, empty is local."""
+    if isinstance(value, (list, tuple)):
+        value = ",".join(str(p).strip() for p in value if str(p).strip())
+    return str(value).strip() if value not in (None, "") and str(value).strip() else default
+
+
+def _cron_deliver_step(j: dict) -> dict:
+    deliver = _deliver_text(j.get("deliver"))
+    failure = _deliver_text(j.get("failure_deliver"), "")
+    detail = "Output is saved, not sent" if deliver == "local" else ""
+    if failure:
+        detail = (detail + " \u00b7 " if detail else "") + "failures \u2192 " + failure
+    return {"type": "deliver", "kind": "deliver", "label": deliver, "detail": detail,
+            "deliver": deliver, "job_id": j.get("id")}
 
 
 def _jobs_of(live) -> list[dict]:
@@ -754,7 +768,7 @@ def get_crons(profile: Optional[str] = Query(None)):
             "script": j.get("script"),
             "no_agent": j.get("no_agent", False),
             "status": status,
-            "deliver": j.get("deliver", "local"),
+            "deliver": _deliver_text(j.get("deliver")),
             "workdir": j.get("workdir"),
             "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
             "prompt_full": prompt,
@@ -1157,6 +1171,123 @@ def put_script(update: ScriptUpdate, profile: Optional[str] = Query(None)):
     return {"ok": True, "path": str(target)}
 
 
+@contextmanager
+def _profile_secrets(profile: Optional[str]):
+    """Hermes' per-profile config and secret scope, so a home channel is read from the profile's own
+    .env. Yields False when another profile cannot be scoped; reading it unscoped would show the
+    default profile's channels."""
+    if profile in (None, "", "default"):
+        yield True
+        return
+    try:
+        from hermes_cli.web_server_profiles import _config_profile_scope
+    except ImportError:
+        yield False
+        return
+    with _config_profile_scope(profile):
+        yield True
+
+
+def _channel_name(platform: str, chat_id: str, directory: dict) -> str:
+    for ch in directory.get(platform) or directory.get(platform.lower()) or []:
+        if isinstance(ch, dict) and str(ch.get("id")) == chat_id:
+            return str(ch.get("name") or "")
+    return ""
+
+
+def _unresolved(sd, token: str) -> str:
+    if token.lower() == "origin":
+        return "the job has no origin chat and no platform has a home channel"
+    if token.lower() == "all":
+        return "no platform has a home channel"
+    if ":" in token:
+        return "Hermes could not resolve this chat"
+    if not sd._is_known_delivery_platform(token):
+        return "not a delivery platform Hermes knows (is its plugin enabled?)"
+    env = sd._resolve_home_env_var(token)
+    return "no home channel is set" + (f" ({env})" if env else "") + "; run /sethome there"
+
+
+def _resolve_deliver(job: dict, deliver: str) -> list[dict]:
+    """Where each comma-separated token of ``deliver`` goes, resolved by the scheduler's own code."""
+    tokens = [t.strip() for t in deliver.split(",") if t.strip() and t.strip() != "local"]
+    try:
+        from cron import scheduler_delivery as sd
+    except ImportError:
+        return [{"token": t, "targets": [], "error": "resolving targets needs a newer Hermes"} for t in tokens]
+    try:
+        from gateway.channel_directory import load_directory
+
+        directory = load_directory().get("platforms") or {}
+    except Exception:
+        directory = {}
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+    out = []
+    for token in tokens:
+        entry: dict = {"token": token, "targets": []}
+        try:
+            broadcast = token.lower() in sd._ROUTING_TOKENS
+            for part in sd._expand_routing_tokens(token):
+                t = sd._resolve_single_delivery_target(job, part, from_broadcast=broadcast)
+                if not t:
+                    continue
+                platform, chat_id = str(t.get("platform") or ""), str(t.get("chat_id") or "")
+                via = t.get("_resolved_from") or ""
+                name = _channel_name(platform, chat_id, directory)
+                if not name and via.startswith("origin") and str(origin.get("chat_id")) == chat_id:
+                    name = str(origin.get("chat_name") or "")
+                entry["targets"].append({
+                    "platform": platform, "chat_id": chat_id, "name": name, "via": via,
+                    "thread_id": None if t.get("thread_id") is None else str(t["thread_id"]),
+                })
+            if not entry["targets"]:
+                entry["error"] = _unresolved(sd, token)
+        except Exception as exc:
+            entry["error"] = f"could not resolve: {exc}"
+        out.append(entry)
+    return out
+
+
+def _delivery_options() -> list[dict]:
+    options = [{"id": "local", "name": "Local (save only)", "ready": True},
+               {"id": "origin", "name": "Origin chat", "ready": True}]
+    try:
+        from cron.scheduler_delivery import cron_delivery_targets
+
+        options += [{"id": t["id"], "name": t.get("name") or t["id"], "ready": bool(t.get("home_target_set"))}
+                    for t in cron_delivery_targets() if t.get("id")]
+    except Exception:
+        _log.debug("cron_delivery_targets unavailable", exc_info=True)
+    return options
+
+
+def _find_job(roots: Roots, job_id: str) -> dict:
+    if roots.cron_jobs.exists():
+        for j in _jobs_of(_read_json(roots.cron_jobs, "jobs.json")):
+            if str(j.get("id")) == job_id:
+                return j
+    raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
+
+
+@router.get("/crons/{job_id}/delivery")
+def get_cron_delivery(job_id: str, profile: Optional[str] = Query(None)):
+    job = _find_job(_profile_roots(profile), job_id)
+    deliver = _deliver_text(job.get("deliver"))
+    failure = _deliver_text(job.get("failure_deliver"), "")
+    origin = job.get("origin") if isinstance(job.get("origin"), dict) else None
+    result = {"deliver": deliver, "failure_deliver": failure or None, "origin": origin, "options": [],
+              "targets": [], "failure_targets": []}
+    with _profile_secrets(profile) as scoped:
+        if not scoped:
+            note = "resolving another profile's targets needs a newer Hermes"
+            result["targets"] = [{"token": t, "targets": [], "error": note} for t in deliver.split(",") if t.strip() not in ("", "local")]
+            return result
+        result["targets"] = _resolve_deliver(job, deliver)
+        result["failure_targets"] = _resolve_deliver(job, failure) if failure else []
+        result["options"] = _delivery_options()
+    return result
+
+
 # Cron jobs and webhook routes are written through Hermes' own store functions, which hold
 # the same locks as the scheduler and the gateway, so an edit here cannot race a run.
 @router.put("/crons/{job_id}/prompt")
@@ -1174,6 +1305,26 @@ def put_cron_prompt(job_id: str, update: TextUpdate, profile: Optional[str] = Qu
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return {"ok": True, "id": job_id}
+
+
+@router.put("/crons/{job_id}/deliver")
+def put_cron_deliver(job_id: str, update: TextUpdate, profile: Optional[str] = Query(None)):
+    _editable_roots(profile, "cron jobs")
+    from cron import jobs as cron_jobs
+
+    job = cron_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
+    if _deliver_text(job.get("deliver")) != _deliver_text(update.expected):
+        raise HTTPException(status_code=409, detail=f"The delivery target {_CONFLICT}")
+    # "local" only means "send nowhere", so next to a real target it is dropped.
+    tokens = dict.fromkeys(t.strip() for t in update.content.split(",") if t.strip() and t.strip() != "local")
+    deliver = ",".join(tokens) or "local"
+    try:
+        cron_jobs.update_job(job_id, {"deliver": deliver})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"ok": True, "id": job_id, "deliver": deliver}
 
 
 @router.put("/webhooks/{name}/prompt")
