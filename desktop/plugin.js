@@ -803,7 +803,7 @@ export default {
       {
         id: 'nav',
         area: SIDEBAR_NAV_AREA,
-        data: { path: '/ariadne-thread', label: "Ariadne's Thread", codicon: 'git-merge' },
+        data: { path: '/ariadne-thread', label: "Ariadne's Thread", codicon: 'type-hierarchy-sub' },
       },
     ])
   },
