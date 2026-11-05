@@ -2,7 +2,7 @@
 
 n8n-style flows for your Hermes skills and crons.
 
-Ariadne's Thread adds a page to Hermes Desktop that draws each cron job, webhook route, and skill as a chain of steps. A cron shows its script, prompt, attached skills, and delivery target. A skill shows the steps it describes, read from its `SKILL.md`. You can click a skill step to open that skill, edit your own skills in place, or draft a change request in a new chat.
+Ariadne's Thread adds a page to Hermes Desktop that draws each cron job, webhook route, and skill as a chain of steps. A cron shows its script, prompt, attached skills, and delivery target. A skill shows the steps it describes, read from its `SKILL.md`. Open any step to read it, edit it right there, or draft a change request for it in a new chat.
 
 <!-- Screenshot: Crons tab with a selected job and its flow -->
 <!-- Screenshot: Skills tab with a parsed skill flow -->
@@ -35,15 +35,27 @@ Restart Hermes Desktop, or rescan plugins, so that it loads the Desktop page. Th
 
 Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
 
-- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a step to look inside it: a skill step opens the skill, a script or deterministic step shows the script file from `scripts/`, and a prompt step shows the whole prompt.
+- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a step to expand it in place: a script or deterministic step widens to show the script file from `scripts/`, and a prompt step shows the whole prompt. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
 - **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow. Its steps open the same way.
-- **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. Select a skill to see its flow, its related skills, the crons that use it, and its `SKILL.md`.
+- **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. A selected skill has two views: **Workflow** shows its flow, its related skills and the crons that use it, and **SKILL.md** shows the whole file.
 
 Use the profile menu in the header to look at another profile. Other profiles are read-only. Skills from `skills.external_dirs` are also read-only and show an **external** badge. If a local skill and an external skill have the same name, the local one wins, as it does in Hermes.
 
-To change a skill yourself, click **Edit**, change the `SKILL.md`, and click **Save**. The plugin checks the frontmatter before it writes.
+### Edit in place
 
-To ask an agent for the change, type the request under **Ask an agent to change it** and click **Draft in new chat**. Ariadne's Thread opens a new chat with a prompt that names the skill file and your request. Nothing runs until you send that message. If the draft cannot be placed, the prompt goes to your clipboard.
+An expanded step has an **Edit** button. It turns the step into a text box; **Save** (or ⌘/Ctrl+Enter) writes it, **Cancel** (or Esc) drops it. What you can edit:
+
+- a skill step: the lines of `SKILL.md` that step came from. The rest of the file is left as it was, and the whole file must still pass the frontmatter checks.
+- the whole `SKILL.md`, from the **SKILL.md** view.
+- a cron job's prompt.
+- a webhook route's prompt template. Its secret and other fields are kept.
+- a script step's file in `scripts/`, unless it is over 256 KB.
+
+Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Deliver and trigger steps are read-only.
+
+### Ask an agent
+
+Every editable step also has an **Ask an agent to change it** box, and the skill has one for the whole file under its views. Type the request and click **Draft in new chat**. Ariadne's Thread opens a new chat with a prompt that names the file or job, quotes the step's current text, and adds your request. Nothing runs until you send that message. If the draft cannot be placed, the prompt goes to your clipboard.
 
 ### How skills become flows
 
@@ -62,7 +74,14 @@ It reads:
 - a script in `scripts/` when you click a script step, the same folder Hermes runs cron and webhook scripts from. It refuses paths that resolve outside that folder and shows at most the first 256 KB. The script is shown as it is, so anything written into it is visible on screen.
 - the folder names in `profiles/`, and the same sources inside a profile when you pick it
 
-It writes only one thing. When you click **Save** in the editor, it replaces that skill's `SKILL.md` through a temporary file in the same folder. It writes only skills of the active profile whose real path is inside `skills/`. It never writes to external skill folders.
+It writes only when you click **Save**, and only in the active profile:
+
+- a skill's `SKILL.md`, whole or one step's lines, through a temporary file in the same folder. Only skills whose real path is inside `skills/`; never external skill folders.
+- a script in `scripts/`, through a temporary file, keeping its file mode. Paths outside `scripts/` are refused.
+- a cron job's `prompt`, through Hermes' own cron store (`cron.jobs.update_job`), which takes the same lock as the scheduler.
+- a webhook route's `prompt`, through Hermes' own webhook store, which takes the same lock as the gateway and keeps the route's secret.
+
+Every save is refused if the text on disk no longer matches what you started editing.
 
 It does not:
 

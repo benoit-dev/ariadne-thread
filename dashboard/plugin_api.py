@@ -1,19 +1,24 @@
 """Ariadne's Thread: backend API for the Hermes Desktop plugin.
 
 Read-only views over the files Hermes already keeps, plus guarded editing of
-the active profile's own skills:
+the active profile's own skills, scripts, cron prompts and webhook prompts:
 
-  GET  /health           -> {ok, name, version, sources}
-  GET  /profiles         -> {profiles}
-  GET  /crons            -> {jobs, total, categories, updated_at}
-  GET  /webhooks         -> {routes}
-  GET  /skills           -> {skills, count}
-  GET  /skills/{name}    -> skill detail, raw SKILL.md and its parsed flow
-  GET  /scripts?path=... -> a cron or webhook script from <home>/scripts
-  PUT  /skills/{name}    -> edit a skill (validated, atomic write)
+  GET  /health                 -> {ok, name, version, sources}
+  GET  /profiles               -> {profiles}
+  GET  /crons                  -> {jobs, total, categories, updated_at}
+  GET  /webhooks               -> {routes}
+  GET  /skills                 -> {skills, count}
+  GET  /skills/{name}          -> skill detail, raw SKILL.md and its parsed flow
+  GET  /scripts?path=...       -> a cron or webhook script from <home>/scripts
+  PUT  /skills/{name}          -> edit a skill (validated, atomic write)
+  PUT  /skills/{name}/span     -> edit the lines of one flow step
+  PUT  /scripts                -> edit a script in <home>/scripts
+  PUT  /crons/{id}/prompt      -> edit a cron job's prompt
+  PUT  /webhooks/{name}/prompt -> edit a webhook route's prompt
 
-The read endpoints take an optional ?profile=<name> to look at another
-profile's files read-only. Paths are resolved per request because this module
+Every edit carries the text the user started from and gets 409 if the file
+changed since. The read endpoints take an optional ?profile=<name> to look at
+another profile's files read-only. Paths are resolved per request because this module
 can be served from a profile-scoped host process.
 
 Webhook HMAC secrets are never serialized.
@@ -526,8 +531,9 @@ def _step(doc: _Doc, label: str, detail: str, a: int, b: int) -> dict:
         kind = "script"
     else:
         kind = "agent"
+    # span: the body lines [a, b) this step came from, so PUT /skills/{name}/span can edit just them.
     step = {"type": kind, "kind": kind, "kindLabel": kind, "label": label, "detail": detail,
-            "body": doc.span(a, b).strip()}
+            "body": doc.span(a, b).strip(), "span": [a, b]}
     if ref:
         step["name"] = ref
     return step
@@ -739,6 +745,7 @@ def get_crons(profile: Optional[str] = Query(None)):
             issues.append("No skill or script attached")
 
         jobs.append({
+            "id": j.get("id"),
             "name": name,
             "schedule": schedule,
             "schedule_human": _humanize_schedule(schedule),
@@ -932,6 +939,8 @@ def get_skill(name: str, profile: Optional[str] = Query(None)):
 
 class SkillUpdate(BaseModel):
     content: str
+    # The SKILL.md the edit started from. Older clients omit it and overwrite unconditionally.
+    expected: Optional[str] = None
 
 
 def _validate_skill_content(content: str) -> Optional[str]:
@@ -994,30 +1003,93 @@ def _announce_skill_change(name: str) -> None:
         _log.debug("skills.changed broadcast skipped", exc_info=True)
 
 
-@router.put("/skills/{name}")
-def put_skill(name: str, update: SkillUpdate, profile: Optional[str] = Query(None)):
+def _editable_roots(profile: Optional[str], what: str) -> Roots:
     roots = _profile_roots(profile)
     if not roots.editable:
-        raise HTTPException(status_code=403, detail="skills of other profiles are read-only here")
+        raise HTTPException(status_code=403, detail=f"{what} of other profiles are read-only here")
+    return roots
+
+
+def _writable_skill(name: str, roots: Roots) -> SkillRef:
     ref = _resolve_skill(name, roots)
     if ref.root != roots.skills:
         raise HTTPException(status_code=403, detail="skills from skills.external_dirs are read-only here")
     if not _within(ref.md, roots.skills):
         raise HTTPException(status_code=403, detail="this skill lives outside the skills directory and is read-only")
-    err = _validate_skill_content(update.content)
+    return ref
+
+
+def _save_skill(name: str, ref: SkillRef, content: str) -> dict:
+    err = _validate_skill_content(content)
     if err:
         raise HTTPException(status_code=422, detail=err)
 
-    _atomic_write(Path(os.path.realpath(ref.md)), update.content)
+    _atomic_write(Path(os.path.realpath(ref.md)), content)
     _announce_skill_change(name)
 
-    fm, _ = _split_frontmatter(update.content)
+    fm, _ = _split_frontmatter(content)
     return {
         "ok": True,
         "name": name,
         "description": str(fm.get("description") or ""),
         "path": str(ref.md),
     }
+
+
+@router.put("/skills/{name}")
+def put_skill(name: str, update: SkillUpdate, profile: Optional[str] = Query(None)):
+    roots = _editable_roots(profile, "skills")
+    ref = _writable_skill(name, roots)
+    if update.expected is not None and ref.md.read_bytes().decode("utf-8", errors="replace") != update.expected:
+        raise HTTPException(status_code=409, detail=f"SKILL.md {_CONFLICT}")
+    return _save_skill(name, ref, update.content)
+
+
+class SpanUpdate(BaseModel):
+    start: int
+    end: int
+    expected: str
+    content: str
+
+
+_CONFLICT = "it changed on disk since you opened it; reload and try again"
+
+
+def _body_bounds(text: str) -> tuple[int, int]:
+    """Offsets of the body _split_frontmatter returns, so a step span maps back onto the file."""
+    content_start = len(text) - len(text.lstrip("\ufeff"))
+    content = text[content_start:]
+    after = 0
+    if content.startswith("---"):
+        end = re.search(r"\n---\s*\n", content[3:])
+        if end:
+            after = end.end() + 3
+    rest = content[after:]
+    start = content_start + after + len(rest) - len(rest.lstrip())
+    return start, content_start + after + len(rest.rstrip())
+
+
+@router.put("/skills/{name}/span")
+def put_skill_span(name: str, update: SpanUpdate, profile: Optional[str] = Query(None)):
+    """Replace the body lines [start, end) of one flow step, if they still read as `expected`."""
+    roots = _editable_roots(profile, "skills")
+    ref = _writable_skill(name, roots)
+    text = ref.md.read_bytes().decode("utf-8", errors="replace")
+    a, b = _body_bounds(text)
+    # Odd entries are the line breaks, so the file keeps its own line endings.
+    parts = re.split(r"(\r\n|\r|\n)", text[a:b])
+    lines = parts[0::2]
+    if not 0 <= update.start < update.end <= len(lines):
+        raise HTTPException(status_code=409, detail=f"This step's lines no longer exist: {_CONFLICT}")
+    old = "".join(parts[2 * update.start : 2 * update.end - 1])
+    if old.expandtabs(4).strip() != update.expected.strip():
+        raise HTTPException(status_code=409, detail=f"This step's text {_CONFLICT}")
+    newline = parts[1] if len(parts) > 1 else "\n"
+    lead = old[: len(old) - len(old.lstrip())]
+    trail = old[len(old.rstrip()) :]
+    new = re.sub(r"\r\n|\r|\n", newline, update.content.strip())
+    spliced = "".join(parts[: 2 * update.start]) + lead + new + trail + "".join(parts[2 * update.end - 1 :])
+    return _save_skill(name, ref, text[:a] + spliced + text[b:])
 
 
 def _script_path(value: str, scripts: Path) -> Path:
@@ -1056,6 +1128,71 @@ def get_script(path: str = Query(...), profile: Optional[str] = Query(None)):
         "truncated": len(data) > MAX_SCRIPT_BYTES,
         "content": data[:MAX_SCRIPT_BYTES].decode("utf-8", errors="replace"),
     }
+
+
+class TextUpdate(BaseModel):
+    expected: str
+    content: str
+
+
+class ScriptUpdate(TextUpdate):
+    path: str
+
+
+@router.put("/scripts")
+def put_script(update: ScriptUpdate, profile: Optional[str] = Query(None)):
+    roots = _editable_roots(profile, "scripts")
+    target = _script_path(update.path, roots.scripts)
+    try:
+        if target.stat().st_size > MAX_SCRIPT_BYTES:
+            raise HTTPException(status_code=413, detail="this script is too large to edit here")
+        current = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=415, detail="this script is not UTF-8 text")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"unreadable: {exc}")
+    if current != update.expected:
+        raise HTTPException(status_code=409, detail=f"The script {_CONFLICT}")
+    _atomic_write(target, update.content)
+    return {"ok": True, "path": str(target)}
+
+
+# Cron jobs and webhook routes are written through Hermes' own store functions, which hold
+# the same locks as the scheduler and the gateway, so an edit here cannot race a run.
+@router.put("/crons/{job_id}/prompt")
+def put_cron_prompt(job_id: str, update: TextUpdate, profile: Optional[str] = Query(None)):
+    _editable_roots(profile, "cron jobs")
+    from cron import jobs as cron_jobs
+
+    job = cron_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
+    if (job.get("prompt") or "") != update.expected:
+        raise HTTPException(status_code=409, detail=f"The prompt {_CONFLICT}")
+    try:
+        cron_jobs.update_job(job_id, {"prompt": update.content})
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"ok": True, "id": job_id}
+
+
+@router.put("/webhooks/{name}/prompt")
+def put_webhook_prompt(name: str, update: TextUpdate, profile: Optional[str] = Query(None)):
+    _editable_roots(profile, "webhooks")
+    try:
+        from hermes_cli.webhook import SubscriptionMutationConflict, _load_subscriptions, _replace_subscription
+    except ImportError:
+        raise HTTPException(status_code=501, detail="editing webhook routes needs a newer Hermes")
+    route = _load_subscriptions().get(name)
+    if not isinstance(route, dict):
+        raise HTTPException(status_code=404, detail=f"webhook route not found: {name}")
+    if (route.get("prompt") or "") != update.expected:
+        raise HTTPException(status_code=409, detail=f"The prompt {_CONFLICT}")
+    try:
+        _replace_subscription(name, {**route, "prompt": update.content}, route)
+    except SubscriptionMutationConflict:
+        raise HTTPException(status_code=409, detail=f"The route {_CONFLICT}")
+    return {"ok": True, "name": name}
 
 
 @router.get("/profiles")

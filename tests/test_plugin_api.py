@@ -791,3 +791,118 @@ def test_flow_steps_carry_their_section_text(api):
     first, second = result["steps"]
     assert "curl x" in first["body"]
     assert second["body"] == "Done."
+
+
+STEP_SKILL = "---\r\nname: steps\r\ndescription: Two steps\r\n---\r\n\r\n# steps\r\n\r\n## Step 1: Fetch\r\n\r\nGet it.\r\n\r\n## Step 2: Report\r\n\r\nSay it.\r\n"
+
+
+def step_of(client, name, index):
+    return client.get(f"/skills/{name}").json()["flow"]["steps"][index]
+
+
+def test_a_step_is_edited_in_place_and_the_rest_of_the_file_is_kept(client, home):
+    md = write_skill(home / "skills", "steps", body=STEP_SKILL)
+    step = step_of(client, "steps", 0)
+
+    response = client.put("/skills/steps/span", json={"start": step["span"][0], "end": step["span"][1], "expected": step["body"], "content": "Get it twice.\nThen stop."})
+
+    assert response.status_code == 200, response.text
+    assert md.read_bytes().decode() == STEP_SKILL.replace("Get it.", "Get it twice.\r\nThen stop.")
+    assert step_of(client, "steps", 1)["body"] == "Say it."
+
+
+def test_a_step_edit_is_refused_when_the_step_changed_on_disk(client, home):
+    md = write_skill(home / "skills", "steps", body=STEP_SKILL)
+    step = step_of(client, "steps", 1)
+    md.write_text(STEP_SKILL.replace("Say it.", "Someone else said it."))
+
+    response = client.put("/skills/steps/span", json={"start": step["span"][0], "end": step["span"][1], "expected": step["body"], "content": "Mine."})
+
+    assert response.status_code == 409
+    assert "Someone else said it." in md.read_text()
+
+
+def test_a_step_edit_that_breaks_the_skill_is_refused(client, home):
+    write_skill(home / "skills", "steps", body=STEP_SKILL)
+    step = step_of(client, "steps", 0)
+
+    response = client.put("/skills/steps/span", json={"start": 999, "end": 1000, "expected": step["body"], "content": "x"})
+
+    assert response.status_code == 409
+
+
+def test_steps_of_external_skills_and_other_profiles_are_read_only(client, home, tmp_path_factory):
+    external = tmp_path_factory.mktemp("external")
+    write_skill(external, "steps", body=STEP_SKILL)
+    (home / "config.yaml").write_text(f"skills:\n  external_dirs:\n    - {external}\n")
+    (home / "profiles" / "work").mkdir(parents=True)
+    step = step_of(client, "steps", 0)
+    edit = {"start": step["span"][0], "end": step["span"][1], "expected": step["body"], "content": "x"}
+
+    assert client.put("/skills/steps/span", json=edit).status_code == 403
+    assert client.put("/skills/steps/span", params={"profile": "work"}, json=edit).status_code == 403
+
+
+def test_a_script_is_saved_with_its_mode_and_only_from_what_was_read(client, home):
+    script = home / "scripts" / "job.sh"
+    script.parent.mkdir()
+    script.write_text("echo old\n")
+    script.chmod(0o755)
+
+    stale = client.put("/scripts", json={"path": "job.sh", "expected": "echo older\n", "content": "echo new\n"})
+    saved = client.put("/scripts", json={"path": "job.sh", "expected": "echo old\n", "content": "echo new\n"})
+
+    assert stale.status_code == 409
+    assert saved.status_code == 200, saved.text
+    assert script.read_text() == "echo new\n"
+    assert stat.S_IMODE(script.stat().st_mode) == 0o755
+
+
+def test_scripts_outside_the_scripts_folder_cannot_be_written(client, home):
+    (home / "scripts").mkdir()
+    (home / ".env").write_text("TOKEN=x")
+
+    response = client.put("/scripts", json={"path": "../.env", "expected": "TOKEN=x", "content": "TOKEN=y"})
+
+    assert response.status_code == 403
+    assert (home / ".env").read_text() == "TOKEN=x"
+
+
+def test_a_cron_prompt_is_saved_through_the_hermes_cron_store(client, home):
+    cron_jobs = pytest.importorskip("cron.jobs")
+    job = cron_jobs.create_job(prompt="Old prompt", schedule="every 1h", name="hourly")
+    listed = client.get("/crons").json()["jobs"][0]
+    assert listed["id"] == job["id"]
+
+    stale = client.put(f"/crons/{job['id']}/prompt", json={"expected": "Older prompt", "content": "New"})
+    saved = client.put(f"/crons/{job['id']}/prompt", json={"expected": "Old prompt", "content": "New prompt"})
+
+    assert stale.status_code == 409
+    assert saved.status_code == 200, saved.text
+    assert cron_jobs.get_job(job["id"])["prompt"] == "New prompt"
+    assert client.put("/crons/missing/prompt", json={"expected": "", "content": "x"}).status_code == 404
+
+
+def test_a_webhook_prompt_is_saved_and_the_secret_is_kept(client, home):
+    pytest.importorskip("hermes_cli.webhook")
+    write_json(home / "webhook_subscriptions.json", {"gh": {"prompt": "Old", "secret": "s3cret", "events": ["push"]}})
+
+    stale = client.put("/webhooks/gh/prompt", json={"expected": "Older", "content": "New"})
+    saved = client.put("/webhooks/gh/prompt", json={"expected": "Old", "content": "New"})
+
+    assert stale.status_code == 409
+    assert saved.status_code == 200, saved.text
+    assert "s3cret" not in saved.text
+    stored = json.loads((home / "webhook_subscriptions.json").read_text())
+    assert stored["gh"] == {"prompt": "New", "secret": "s3cret", "events": ["push"]}
+
+
+def test_a_whole_skill_save_is_refused_when_the_file_changed_since_it_was_read(client, home):
+    md = write_skill(home / "skills", "target")
+    read = client.get("/skills/target").json()["raw"]
+    md.write_text(VALID_SKILL.format(name="target", description="changed elsewhere"))
+
+    stale = client.put("/skills/target", json={"content": read.replace("Do the thing.", "Mine."), "expected": read})
+
+    assert stale.status_code == 409
+    assert "changed elsewhere" in md.read_text()
