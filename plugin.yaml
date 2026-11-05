@@ -1,0 +1,12 @@
+name: ariadne-thread
+version: "0.1.0"
+description: "n8n-style flows for your Hermes skills and crons: see each cron, webhook and skill as a step-by-step flow, and edit your own skills in place."
+author: benoit-dev
+license: MIT
+requires_hermes: ">=0.22.0"
+tags: [skills, cron, webhooks, workflows, desktop]
+# Ships a dashboard API router and a Desktop page only: no agent tools, hooks,
+# middleware or privileged host capabilities are registered.
+provides_tools: []
+provides_hooks: []
+capabilities: []
