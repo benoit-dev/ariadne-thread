@@ -48,6 +48,12 @@ const KIND_STYLE = {
 
 const kindStyle = (kind) => KIND_STYLE[kind] || KIND_STYLE.prompt
 
+// What clicking a step opens: the skill it names, its script file, or its full text.
+const stepAction = (step) =>
+  step.type === 'skill' && step.name ? 'skill' : step.script ? 'script' : step.body ? 'text' : null
+
+const STEP_TITLE = { skill: 'Open skill', script: 'Show script', text: 'Show full text' }
+
 // Hyperscript over jsx/jsxs: children as trailing args, key pulled out of props.
 function h(type, props, ...kids) {
   const { key, ...rest } = props || {}
@@ -58,7 +64,7 @@ function h(type, props, ...kids) {
 
 // The default profile is the host's own; any other name is a read-only view.
 const withProfile = (path, profile) =>
-  profile && profile !== 'default' ? path + '?profile=' + encodeURIComponent(profile) : path
+  profile && profile !== 'default' ? path + (path.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(profile) : path
 
 const errorText = (e) => (e && e.message) || String(e)
 
@@ -128,7 +134,7 @@ function Pipeline({ sequence, onStepClick }) {
     { style: { display: 'flex', flexDirection: 'column' } },
     sequence.map((step, i) => {
       const st = kindStyle(step.kind || step.type)
-      const skillName = onStepClick && step.type === 'skill' && step.name ? step.name : null
+      const action = onStepClick ? stepAction(step) : null
       return h(
         'div',
         { key: i, style: { display: 'flex', flexDirection: 'column' } },
@@ -136,8 +142,8 @@ function Pipeline({ sequence, onStepClick }) {
         h(
           'div',
           {
-            onClick: skillName ? () => onStepClick({ type: 'skill', id: skillName }) : undefined,
-            title: skillName ? 'Open skill: ' + skillName : undefined,
+            onClick: action ? () => onStepClick(step) : undefined,
+            title: action ? STEP_TITLE[action] : undefined,
             style: {
               width: '100%',
               maxWidth: '440px',
@@ -147,7 +153,7 @@ function Pipeline({ sequence, onStepClick }) {
               borderRadius: '10px',
               background: 'linear-gradient(180deg, ' + mix(st.color, 9) + ', ' + mix(TXT1, 2) + ')',
               padding: '10px 12px',
-              cursor: skillName ? 'pointer' : 'default',
+              cursor: action ? 'pointer' : 'default',
               display: 'flex',
               flexDirection: 'column',
               gap: '2px',
@@ -209,7 +215,7 @@ function ListRow({ active, onClick, children }) {
   )
 }
 
-function CronsTab({ ctx, profile, nav, onOpenSkill }) {
+function CronsTab({ ctx, profile, nav, onOpenStep }) {
   const [selected, setSelected] = useState(null)
   const q = useQuery({
     queryKey: [ID, 'crons', profile],
@@ -256,11 +262,11 @@ function CronsTab({ ctx, profile, nav, onOpenSkill }) {
     job.issues && job.issues.length
       ? h('div', { style: { marginTop: '8px' } }, job.issues.map((iss, i) => h('div', { key: i, style: { color: AMBER, fontSize: '0.75rem' } }, '⚠ ' + iss)))
       : null,
-    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { sequence: job.sequence, onStepClick: (ref) => onOpenSkill(ref.id) }))
+    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { sequence: job.sequence, onStepClick: onOpenStep }))
   )
 }
 
-function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
+function WebhooksTab({ ctx, profile, nav, onOpenStep }) {
   const [selected, setSelected] = useState(null)
   const q = useQuery({
     queryKey: [ID, 'webhooks', profile],
@@ -295,7 +301,7 @@ function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
     route.events && route.events.length
       ? h('div', { style: { marginTop: '8px', display: 'flex', gap: '4px', flexWrap: 'wrap' } }, route.events.map((e) => h(Badge, { key: e }, e)))
       : h('div', { style: { marginTop: '8px' } }, h(Badge, {}, 'all events')),
-    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { sequence: route.sequence, onStepClick: (ref) => onOpenSkill(ref.id) }))
+    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { sequence: route.sequence, onStepClick: onOpenStep }))
   )
 }
 
@@ -457,7 +463,7 @@ function ChipList({ label, items, tone, onPick }) {
   )
 }
 
-function SkillDetail({ detail, onEdit, onSwitch, onCron }) {
+function SkillDetail({ detail, onEdit, onSwitch, onCron, onOpenStep }) {
   return h(
     Fragment,
     {},
@@ -472,7 +478,10 @@ function SkillDetail({ detail, onEdit, onSwitch, onCron }) {
         : null
     ),
     detail.description ? h('div', { style: { marginTop: '8px', color: TXT3, fontSize: '0.8125rem' } }, detail.description) : null,
-    h(FlowSection, { flow: detail.flow, onStepClick: onSwitch ? (ref) => onSwitch(ref.id) : undefined }),
+    h(FlowSection, {
+      flow: detail.flow,
+      onStepClick: (step) => (stepAction(step) === 'skill' ? onSwitch(step.name) : onOpenStep(step)),
+    }),
     h(ChipList, { label: 'Credentials', items: detail.credentials, tone: 'accent' }),
     h(ChipList, { label: 'Related skills', items: detail.related_skills, onPick: onSwitch }),
     h(ChipList, { label: 'Used by crons', items: detail.used_by_crons, onPick: onCron }),
@@ -501,7 +510,7 @@ function groupByCategory(skills, filter) {
   return [...groups.entries()].sort(([a], [b]) => (a === b ? 0 : a === '' ? 1 : b === '' ? -1 : a.localeCompare(b)))
 }
 
-function SkillsTab({ ctx, profile, nav, onNavigate }) {
+function SkillsTab({ ctx, profile, nav, onNavigate, onOpenStep }) {
   const [selected, setSelected] = useState(null)
   const [filter, setFilter] = useState('')
   const [editing, setEditing] = useState(false)
@@ -566,6 +575,7 @@ function SkillsTab({ ctx, profile, nav, onNavigate }) {
                 onEdit: () => setEditing(true),
                 onSwitch: open,
                 onCron: (cron) => onNavigate('crons', cron),
+                onOpenStep,
               })
             : null)
       : h(Note, { text: 'Select a skill' }),
@@ -649,12 +659,13 @@ function DraftBox({ ctx, detail, onDone }) {
   )
 }
 
-function SkillModal({ name, ctx, profile, onNavigate, onClose }) {
+// A step dialog can open on top of this one; Escape then closes only the step.
+function SkillModal({ name, ctx, profile, covered, onNavigate, onOpenStep, onClose }) {
   const [current, setCurrent] = useState(name)
   const [editing, setEditing] = useState(false)
   const q = useSkill(ctx, profile, current)
   useEscape(ctx, () => {
-    if (!editing) onClose()
+    if (!editing && !covered) onClose()
   })
 
   const detail = q.data
@@ -673,6 +684,7 @@ function SkillModal({ name, ctx, profile, onNavigate, onClose }) {
                 detail,
                 onEdit: () => setEditing(true),
                 onSwitch: setCurrent,
+                onOpenStep,
                 onCron: (cron) => {
                   onClose()
                   onNavigate('crons', cron)
@@ -682,6 +694,44 @@ function SkillModal({ name, ctx, profile, onNavigate, onClose }) {
       ),
       detail && detail.editable ? h(DraftBox, { ctx, detail, onDone: onClose }) : null,
       editing && detail ? h(EditDialog, { skill: detail, ctx, profile, onClose: () => setEditing(false) }) : null
+    )
+  )
+}
+
+const codeBlock = { margin: 0, padding: '12px', borderRadius: '8px', background: 'var(--ui-bg-editor, rgba(128,128,128,0.10))', color: TXT2, fontSize: '0.75rem', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: MONO }
+
+function ScriptBody({ ctx, profile, script }) {
+  const q = useQuery({
+    queryKey: [ID, 'script', profile, script],
+    queryFn: () => ctx.rest(withProfile('/scripts?path=' + encodeURIComponent(script), profile)),
+    refetchInterval: POLL_MS,
+  })
+  const failed = gate(q, 'script')
+  if (failed) return failed
+  const s = q.data
+  return h(
+    Fragment,
+    {},
+    h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
+    s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes.') : null,
+    h('pre', { style: codeBlock }, s.content)
+  )
+}
+
+function StepModal({ step, ctx, profile, onClose }) {
+  useEscape(ctx, onClose)
+  const st = kindStyle(step.kind || step.type)
+  return h(
+    Overlay,
+    { onClose },
+    h(
+      Dialog,
+      { title: st.label + ': ' + (step.label || step.name || ''), onClose },
+      h(
+        'div',
+        { style: { flex: '1', minHeight: 0, overflowY: 'auto', padding: '16px' } },
+        step.script ? h(ScriptBody, { ctx, profile, script: step.script }) : h('pre', { style: codeBlock }, step.body)
+      )
     )
   )
 }
@@ -744,6 +794,8 @@ function AriadnePage({ ctx }) {
   // A badge click can jump to another tab and select an item there: { to, item }.
   const [nav, setNav] = useState(null)
   const [modalSkill, setModalSkill] = useState(null)
+  const [modalStep, setModalStep] = useState(null)
+  const openStep = (step) => (stepAction(step) === 'skill' ? setModalSkill(step.name) : setModalStep(step))
 
   const navigate = (to, item) => {
     setNav({ to, item })
@@ -784,8 +836,11 @@ function AriadnePage({ ctx }) {
       h(ProfileSelect, { ctx, profile, onChange: setProfile })
     ),
     // Keyed by profile so a selection from one profile never leaks into another.
-    h('div', { style: { flex: '1', minHeight: 0 } }, h(Active, { key: profile, ctx, profile, nav, onOpenSkill: setModalSkill, onNavigate: navigate })),
-    modalSkill ? h(SkillModal, { name: modalSkill, ctx, profile, onNavigate: navigate, onClose: () => setModalSkill(null) }) : null
+    h('div', { style: { flex: '1', minHeight: 0 } }, h(Active, { key: profile, ctx, profile, nav, onOpenStep: openStep, onNavigate: navigate })),
+    modalSkill
+      ? h(SkillModal, { name: modalSkill, ctx, profile, covered: !!modalStep, onNavigate: navigate, onOpenStep: setModalStep, onClose: () => setModalSkill(null) })
+      : null,
+    modalStep ? h(StepModal, { step: modalStep, ctx, profile, onClose: () => setModalStep(null) }) : null
   )
 }
 
@@ -803,7 +858,7 @@ export default {
       {
         id: 'nav',
         area: SIDEBAR_NAV_AREA,
-        data: { path: '/ariadne-thread', label: "Ariadne's Thread", codicon: 'type-hierarchy-sub' },
+        data: { path: '/ariadne-thread', label: "Ariadne's thread", codicon: 'type-hierarchy-sub' },
       },
     ])
   },

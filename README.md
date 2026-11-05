@@ -35,8 +35,8 @@ Restart Hermes Desktop, or rescan plugins, so that it loads the Desktop page. Th
 
 Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
 
-- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a skill step to open the skill.
-- **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow.
+- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a step to look inside it: a skill step opens the skill, a script or deterministic step shows the script file from `scripts/`, and a prompt step shows the whole prompt.
+- **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow. Its steps open the same way.
 - **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. Select a skill to see its flow, its related skills, the crons that use it, and its `SKILL.md`.
 
 Use the profile menu in the header to look at another profile. Other profiles are read-only. Skills from `skills.external_dirs` are also read-only and show an **external** badge. If a local skill and an external skill have the same name, the local one wins, as it does in Hermes.
@@ -59,6 +59,7 @@ It reads:
 - `webhook_subscriptions.json`. Webhook secrets are never sent to the UI.
 - every `SKILL.md` under `skills/`, including skill folders that are symlinks to shared folders
 - `config.yaml`, only to find `skills.external_dirs`, and every `SKILL.md` in those folders
+- a script in `scripts/` when you click a script step, the same folder Hermes runs cron and webhook scripts from. It refuses paths that resolve outside that folder and shows at most the first 256 KB. The script is shown as it is, so anything written into it is visible on screen.
 - the folder names in `profiles/`, and the same sources inside a profile when you pick it
 
 It writes only one thing. When you click **Save** in the editor, it replaces that skill's `SKILL.md` through a temporary file in the same folder. It writes only skills of the active profile whose real path is inside `skills/`. It never writes to external skill folders.

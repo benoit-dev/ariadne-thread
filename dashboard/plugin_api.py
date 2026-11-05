@@ -9,6 +9,7 @@ the active profile's own skills:
   GET  /webhooks         -> {routes}
   GET  /skills           -> {skills, count}
   GET  /skills/{name}    -> skill detail, raw SKILL.md and its parsed flow
+  GET  /scripts?path=... -> a cron or webhook script from <home>/scripts
   PUT  /skills/{name}    -> edit a skill (validated, atomic write)
 
 The read endpoints take an optional ?profile=<name> to look at another
@@ -57,6 +58,7 @@ _log = logging.getLogger("ariadne-thread")
 PLUGIN_NAME = "ariadne-thread"
 PLUGIN_VERSION = "0.1.0"
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_SCRIPT_BYTES = 256 * 1024
 
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -73,6 +75,7 @@ _SUPPORT_DIRS = frozenset({"references", "templates", "assets", "scripts"})
 
 class Roots(NamedTuple):
     skills: Path
+    scripts: Path
     cron_jobs: Path
     webhooks: Path
     editable: bool
@@ -92,6 +95,7 @@ def _profile_roots(profile: Optional[str]) -> Roots:
     skills = home / "skills"
     return Roots(
         skills=skills,
+        scripts=home / "scripts",
         cron_jobs=home / "cron" / "jobs.json",
         webhooks=home / "webhook_subscriptions.json",
         editable=editable,
@@ -522,7 +526,8 @@ def _step(doc: _Doc, label: str, detail: str, a: int, b: int) -> dict:
         kind = "script"
     else:
         kind = "agent"
-    step = {"type": kind, "kind": kind, "kindLabel": kind, "label": label, "detail": detail}
+    step = {"type": kind, "kind": kind, "kindLabel": kind, "label": label, "detail": detail,
+            "body": doc.span(a, b).strip()}
     if ref:
         step["name"] = ref
     return step
@@ -668,12 +673,12 @@ def _cron_sequence(j: dict, skills: list[str]) -> list[dict]:
         kind = "deterministic" if j.get("no_agent") else "script"
         sequence.append(
             {"type": "script", "kind": kind, "kindLabel": kind,
-             "label": j["script"], "name": j["script"]}
+             "label": j["script"], "name": j["script"], "script": str(j["script"])}
         )
     if prompt and not j.get("no_agent"):
         sequence.append(
             {"type": "prompt", "kind": "agent", "kindLabel": "agent",
-             "label": "Prompt", "detail": prompt[:80]}
+             "label": "Prompt", "detail": prompt[:80], "body": prompt}
         )
     for s in skills:
         sequence.append(
@@ -771,12 +776,12 @@ def _webhook_sequence(name: str, route: dict) -> list[dict]:
         steps.append({
             "type": "script", "kind": "deterministic",
             "label": "Script", "detail": str(route["script"]),
-            "kindLabel": "deterministic",
+            "kindLabel": "deterministic", "script": str(route["script"]),
         })
     prompt = route.get("prompt") or ""
     steps.append({
         "type": "prompt", "kind": "agent", "label": "Prompt template",
-        "detail": prompt[:200], "kindLabel": "agent",
+        "detail": prompt[:200], "kindLabel": "agent", "body": prompt,
     })
     for skill in _string_list(route.get("skills")):
         steps.append({
@@ -784,11 +789,13 @@ def _webhook_sequence(name: str, route: dict) -> list[dict]:
             "name": skill, "kindLabel": "agent",
         })
     deliver = route.get("deliver", "deliver")
+    extra = route.get("deliver_extra") or {}
     steps.append({
         "type": "deliver", "kind": "deliver",
         "label": deliver,
-        "detail": str(route.get("deliver_extra") or {})[:200],
+        "detail": str(extra)[:200],
         "kindLabel": deliver,
+        "body": json.dumps(extra, indent=2, default=str) if extra else "",
     })
     return steps
 
@@ -1010,6 +1017,44 @@ def put_skill(name: str, update: SkillUpdate, profile: Optional[str] = Query(Non
         "name": name,
         "description": str(fm.get("description") or ""),
         "path": str(ref.md),
+    }
+
+
+def _script_path(value: str, scripts: Path) -> Path:
+    """Resolve a job or route script the way Hermes does: relative to ``<home>/scripts``,
+    ``~/.hermes/...`` mapped to the profile home, and never outside ``<home>/scripts``."""
+    text = os.path.expandvars(value.strip())
+    if "\0" in text or not text:
+        raise HTTPException(status_code=400, detail="invalid script path")
+    if text == "~/.hermes" or text.startswith("~/.hermes/"):
+        raw = scripts.parent / text[len("~/.hermes/"):]
+    else:
+        raw = Path(os.path.expanduser(text))
+    root = scripts.resolve()
+    path = (raw if raw.is_absolute() else root / raw).resolve()
+    if not _within(path, root):
+        raise HTTPException(status_code=403, detail=f"script resolves outside {root}")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"script not found: {path}")
+    return path
+
+
+@router.get("/scripts")
+def get_script(path: str = Query(...), profile: Optional[str] = Query(None)):
+    roots = _profile_roots(profile)
+    target = _script_path(path, roots.scripts)
+    try:
+        with target.open("rb") as fh:
+            data = fh.read(MAX_SCRIPT_BYTES + 1)
+        size = target.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"unreadable: {exc}")
+    return {
+        "path": str(target),
+        "name": target.name,
+        "size": size,
+        "truncated": len(data) > MAX_SCRIPT_BYTES,
+        "content": data[:MAX_SCRIPT_BYTES].decode("utf-8", errors="replace"),
     }
 
 
