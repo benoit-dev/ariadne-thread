@@ -244,7 +244,7 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
               border: '1px solid ' + mix(ACCENT, 30),
               borderLeft: '3px solid ' + ACCENT,
               borderRadius: RADIUS,
-              background: 'linear-gradient(180deg, ' + mix(ACCENT, 9) + ', ' + mix(TXT1, 2) + ')',
+              background: mix(ACCENT, 6),
               padding: '10px 12px',
               cursor: toggleable ? 'pointer' : 'default',
               display: 'flex',
@@ -327,11 +327,12 @@ function ListRow({ active, onClick, children }) {
         width: '100%',
         textAlign: 'left',
         padding: '8px',
-        border: 'none',
-        background: active ? mix(ACCENT, 10) : 'transparent',
-        color: TXT2,
+        borderRadius: RADIUS,
+        // Same active look as the host sidebar's nav items.
+        border: '1px solid ' + (active ? 'var(--ui-stroke-tertiary, ' + STROKE + ')' : 'transparent'),
+        background: active ? 'var(--ui-control-active-background, ' + mix(BLUE, 12) + ')' : 'transparent',
+        color: active ? TXT1 : TXT2,
         cursor: 'pointer',
-        borderLeft: '2px solid ' + (active ? ACCENT : 'transparent'),
       },
     },
     children
@@ -414,12 +415,12 @@ function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
         h(
           ListRow,
           { key: r.name, active: r.name === route.name, onClick: () => setSelected(r.name) },
-          h('span', { style: { fontSize: '0.8125rem' } }, r.name),
-          r.description ? h('div', { style: { fontSize: '0.6875rem', color: TXT3 } }, r.description) : null
+          h('span', { style: { fontSize: '0.8125rem' } }, r.name)
         )
       ),
     },
     h('div', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, route.name),
+    route.description ? h('div', { style: { fontSize: '0.8125rem', color: TXT3, marginTop: '4px' } }, route.description) : null,
     h('div', { style: { fontSize: '0.75rem', color: TXT3, marginTop: '4px', fontFamily: MONO } }, route.path),
     route.events && route.events.length
       ? h('div', { style: { marginTop: '8px', display: 'flex', gap: '4px', flexWrap: 'wrap' } }, route.events.map((e) => h(Badge, { key: e }, e)))
