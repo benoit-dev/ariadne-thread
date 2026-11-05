@@ -97,7 +97,7 @@ The final runs print no warnings. Before `__init__.py` existed, `validate` warne
 $ python -m pytest -q tests
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-41 passed, 1 warning in 1.30s
+47 passed, 1 warning in 1.33s
 (exit code 0)
 ```
 

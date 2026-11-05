@@ -76,6 +76,7 @@ class Roots(NamedTuple):
     cron_jobs: Path
     webhooks: Path
     editable: bool
+    external: tuple[Path, ...] = ()
 
 
 def _profile_roots(profile: Optional[str]) -> Roots:
@@ -88,12 +89,42 @@ def _profile_roots(profile: Optional[str]) -> Roots:
         if not home.is_dir():
             raise HTTPException(status_code=404, detail=f"profile not found: {profile}")
         editable = False
+    skills = home / "skills"
     return Roots(
-        skills=home / "skills",
+        skills=skills,
         cron_jobs=home / "cron" / "jobs.json",
         webhooks=home / "webhook_subscriptions.json",
         editable=editable,
+        external=_external_skill_dirs(home, skills),
     )
+
+
+def _external_skill_dirs(home: Path, local: Path) -> tuple[Path, ...]:
+    """``skills.external_dirs`` from the profile's config.yaml, resolved the way Hermes does:
+    ``~`` and ``${VAR}`` expanded, relative entries anchored at the home, missing dirs and
+    the local skills dir dropped."""
+    config = home / "config.yaml"
+    if _yaml_load is None or not config.is_file():
+        return ()
+    try:
+        cfg = _yaml_load(config.read_text(encoding="utf-8-sig"))
+    except Exception:
+        _log.warning("config.yaml unreadable, external skill dirs skipped: %s", config)
+        return ()
+    skills_cfg = cfg.get("skills") if isinstance(cfg, dict) else None
+    raw = skills_cfg.get("external_dirs") if isinstance(skills_cfg, dict) else None
+    entries = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else []
+    local_real = local.resolve()
+    dirs: list[Path] = []
+    for entry in entries:
+        text = str(entry).strip()
+        if not text:
+            continue
+        p = Path(os.path.expanduser(os.path.expandvars(text)))
+        p = (p if p.is_absolute() else home / p).resolve()
+        if p != local_real and p not in dirs and p.is_dir():
+            dirs.append(p)
+    return tuple(dirs)
 
 
 def _read_json(path: Path, label: str):
@@ -127,21 +158,39 @@ def _skill_files(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _skill_index(skills_root: Path) -> dict[str, Path]:
-    """Skill folder name -> SKILL.md; the shallowest path wins a name collision."""
-    index: dict[str, Path] = {}
-    for md in sorted(_skill_files(skills_root), key=lambda p: (len(p.parts), str(p))):
-        index.setdefault(md.parent.name, md)
+class SkillRef(NamedTuple):
+    md: Path
+    root: Path
+
+
+def _skill_index(roots: Roots) -> dict[str, SkillRef]:
+    """Skill folder name -> where it lives. Like Hermes, the local skills dir shadows the
+    external dirs, which shadow each other in config order; within one dir the shallowest
+    path wins."""
+    index: dict[str, SkillRef] = {}
+    for root in (roots.skills, *roots.external):
+        for md in sorted(_skill_files(root), key=lambda p: (len(p.parts), str(p))):
+            index.setdefault(md.parent.name, SkillRef(md, root))
     return index
 
 
-def _resolve_skill_path(name: str, roots: Roots) -> Path:
+def _resolve_skill(name: str, roots: Roots) -> SkillRef:
     if not _SKILL_NAME_RE.match(name):
         raise HTTPException(status_code=400, detail=f"invalid skill name: {name!r}")
-    md = _skill_index(roots.skills).get(name)
-    if md is None:
+    ref = _skill_index(roots).get(name)
+    if ref is None:
         raise HTTPException(status_code=404, detail=f"skill not found: {name}")
-    return md
+    return ref
+
+
+def _skill_location(ref: SkillRef, roots: Roots) -> dict:
+    local = ref.root == roots.skills
+    return {
+        "category": _category_of(ref.md, ref.root),
+        "path": str(ref.md),
+        "source": "local" if local else "external",
+        "editable": roots.editable and local and _within(ref.md, roots.skills),
+    }
 
 
 def _category_of(md: Path, skills_root: Path) -> str:
@@ -650,7 +699,7 @@ def get_crons(profile: Optional[str] = Query(None)):
     if not roots.cron_jobs.exists():
         return {"jobs": [], "total": 0, "categories": {}, "updated_at": ""}
     live = _read_json(roots.cron_jobs, "jobs.json")
-    index = _skill_index(roots.skills)
+    index = _skill_index(roots)
 
     jobs = []
     categories: dict = {}
@@ -666,9 +715,9 @@ def get_crons(profile: Optional[str] = Query(None)):
 
         category = ""
         for s in skills:
-            md = index.get(s.rsplit("/", 1)[-1])
-            if md is not None:
-                category = _category_of(md, roots.skills)
+            ref = index.get(s.rsplit("/", 1)[-1])
+            if ref is not None:
+                category = _category_of(ref.md, ref.root)
                 break
 
         if not j.get("enabled", True):
@@ -833,39 +882,36 @@ def _skill_summary(path: str, mtime_ns: int, size: int) -> _Summary:
 def list_skills(profile: Optional[str] = Query(None)):
     roots = _profile_roots(profile)
     skills = []
-    for md in _skill_files(roots.skills):
+    for name, ref in _skill_index(roots).items():
         try:
-            st = md.stat()
-            summary = _skill_summary(str(md), st.st_mtime_ns, st.st_size)
+            st = ref.md.stat()
+            summary = _skill_summary(str(ref.md), st.st_mtime_ns, st.st_size)
             skills.append({
-                "name": md.parent.name,
-                "category": _category_of(md, roots.skills),
-                "path": str(md),
+                "name": name,
+                **_skill_location(ref, roots),
                 "description": summary.description,
                 "has_credentials": summary.has_credentials,
                 "related": list(summary.related),
-                "editable": roots.editable and _within(md, roots.skills),
                 "steps": summary.steps,
                 "fallback": summary.fallback,
             })
         except Exception as exc:  # one broken skill must not hide the others
-            _log.warning("skill scan failed for %s: %s", md, exc)
+            _log.warning("skill scan failed for %s: %s", ref.md, exc)
     return {"skills": skills, "count": len(skills)}
 
 
 @router.get("/skills/{name}")
 def get_skill(name: str, profile: Optional[str] = Query(None)):
     roots = _profile_roots(profile)
-    md = _resolve_skill_path(name, roots)
+    ref = _resolve_skill(name, roots)
     try:
-        text = md.read_text(encoding="utf-8", errors="replace")
+        text = ref.md.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"unreadable: {exc}")
     fm, body = _split_frontmatter(text)
     return {
         "name": name,
-        "category": _category_of(md, roots.skills),
-        "path": str(md),
+        **_skill_location(ref, roots),
         "frontmatter": _json_safe(fm),
         "description": str(fm.get("description") or ""),
         "credentials": _credential_names(fm),
@@ -873,7 +919,6 @@ def get_skill(name: str, profile: Optional[str] = Query(None)):
         "raw": text,
         "related_skills": _related_skills(fm, body),
         "used_by_crons": _used_by_crons(name, roots),
-        "editable": roots.editable and _within(md, roots.skills),
         "flow": parse_skill_flow(fm, body),
     }
 
@@ -947,14 +992,16 @@ def put_skill(name: str, update: SkillUpdate, profile: Optional[str] = Query(Non
     roots = _profile_roots(profile)
     if not roots.editable:
         raise HTTPException(status_code=403, detail="skills of other profiles are read-only here")
-    md = _resolve_skill_path(name, roots)
-    if not _within(md, roots.skills):
+    ref = _resolve_skill(name, roots)
+    if ref.root != roots.skills:
+        raise HTTPException(status_code=403, detail="skills from skills.external_dirs are read-only here")
+    if not _within(ref.md, roots.skills):
         raise HTTPException(status_code=403, detail="this skill lives outside the skills directory and is read-only")
     err = _validate_skill_content(update.content)
     if err:
         raise HTTPException(status_code=422, detail=err)
 
-    _atomic_write(Path(os.path.realpath(md)), update.content)
+    _atomic_write(Path(os.path.realpath(ref.md)), update.content)
     _announce_skill_change(name)
 
     fm, _ = _split_frontmatter(update.content)
@@ -962,7 +1009,7 @@ def put_skill(name: str, update: SkillUpdate, profile: Optional[str] = Query(Non
         "ok": True,
         "name": name,
         "description": str(fm.get("description") or ""),
-        "path": str(md),
+        "path": str(ref.md),
     }
 
 

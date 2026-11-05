@@ -466,7 +466,7 @@ function SkillDetail({ detail, onEdit, onSwitch, onCron }) {
       { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
       h('div', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, detail.name),
       detail.category ? h(Badge, {}, detail.category) : null,
-      !detail.editable ? h(Badge, {}, 'read-only') : null,
+      detail.source === 'external' ? h(Badge, {}, 'external') : !detail.editable ? h(Badge, {}, 'read-only') : null,
       onEdit && detail.editable
         ? h('button', { onClick: onEdit, style: { ...outlineButton, marginLeft: 'auto', padding: '4px 10px', fontSize: '0.75rem' } }, '✎ Edit')
         : null

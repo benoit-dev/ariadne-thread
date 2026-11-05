@@ -48,7 +48,6 @@ An empty skills folder gives `skills parsed: 0`. Against an empty `HERMES_HOME`,
 - **Skill references are rare.** Only 8 steps across 193 skills are `skill` steps. Plain prose such as "load himalaya" is not detected.
 - **Unnumbered procedures fall back.** `test-driven-development` is a real procedure (RED, GREEN, REFACTOR as `###` headings) but lands in `sections`. The `sections` fallback reads `##` only, so a skill with only `#` or `###` headings becomes `single`. Four optional skills (`archify`, `brag`, `brag-slim`, `impeccable`) are `single`.
 - **Name collisions.** Detail views resolve a skill by its folder name. If two folders share a name, the shallowest path wins.
-- **External skill folders are not listed.** The plugin reads `<profile>/skills/` and follows symlinks inside it. Folders that Hermes adds through `skills.external_dirs` do not appear.
 
 ## Full table
 

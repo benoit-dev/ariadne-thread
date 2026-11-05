@@ -212,6 +212,101 @@ def test_other_profiles_are_listed_and_read_only(client, home):
     assert put.status_code == 403
 
 
+def write_config(home: Path, text: str) -> None:
+    (home / "config.yaml").write_text(dedent(text))
+
+
+def test_external_skill_dirs_are_listed_read_only(client, home, tmp_path_factory, monkeypatch):
+    team = tmp_path_factory.mktemp("team-skills")
+    write_skill(team, "review/code-review")
+    by_var = tmp_path_factory.mktemp("var-skills")
+    write_skill(by_var, "release-notes")
+    write_skill(home / "shared-relative", "triage")
+    monkeypatch.setenv("ARIADNE_TEST_SKILLS", str(by_var))
+    write_config(home, f"""\
+        skills:
+          external_dirs:
+            - {team}
+            - ${{ARIADNE_TEST_SKILLS}}
+            - shared-relative
+            - {home / "does-not-exist"}
+            - {home / "skills"}
+        """)
+    write_skill(home / "skills", "local-one")
+
+    listing = {s["name"]: s for s in client.get("/skills").json()["skills"]}
+
+    assert set(listing) == {"local-one", "code-review", "release-notes", "triage"}
+    assert (listing["local-one"]["source"], listing["local-one"]["editable"]) == ("local", True)
+    for name in ("code-review", "release-notes", "triage"):
+        assert (listing[name]["source"], listing[name]["editable"]) == ("external", False)
+    assert listing["code-review"]["category"] == "review"
+
+    detail = client.get("/skills/code-review").json()
+    assert (detail["source"], detail["editable"]) == ("external", False)
+    assert detail["path"] == str(team / "review" / "code-review" / "SKILL.md")
+
+    put = client.put("/skills/code-review", json={"content": VALID_SKILL.format(name="code-review", description="x")})
+    assert put.status_code == 403
+    assert "external_dirs" in put.json()["detail"]
+
+
+def test_local_skills_shadow_external_ones_like_hermes(client, home, tmp_path_factory):
+    first = tmp_path_factory.mktemp("first")
+    second = tmp_path_factory.mktemp("second")
+    write_skill(first, "deploy", description="from first")
+    write_skill(second, "deploy", description="from second")
+    write_skill(second, "lint", description="from second")
+    write_skill(home / "skills", "lint", description="local")
+    write_config(home, f"""\
+        skills:
+          external_dirs: [{first}, {second}]
+        """)
+
+    listing = {s["name"]: s for s in client.get("/skills").json()["skills"]}
+
+    assert client.get("/skills").json()["count"] == 2
+    assert (listing["lint"]["description"], listing["lint"]["source"]) == ("local", "local")
+    assert listing["deploy"]["description"] == "from first"
+
+
+def test_a_single_external_dir_string_is_accepted(client, home, tmp_path_factory):
+    team = tmp_path_factory.mktemp("team")
+    write_skill(team, "solo")
+    write_config(home, f"skills:\n  external_dirs: {team}\n")
+
+    assert names(client.get("/skills")) == ["solo"]
+
+
+def test_broken_config_does_not_hide_local_skills(client, home):
+    write_skill(home / "skills", "still-here")
+    write_config(home, "skills: [unclosed\n")
+
+    assert names(client.get("/skills")) == ["still-here"]
+
+
+def test_external_dirs_follow_the_selected_profile_config(client, home, tmp_path_factory):
+    work_shared = tmp_path_factory.mktemp("work-shared")
+    write_skill(work_shared, "work-external")
+    work = home / "profiles" / "work"
+    work.mkdir(parents=True)
+    write_config(work, f"skills:\n  external_dirs: [{work_shared}]\n")
+    write_json(work / "cron" / "jobs.json", {"jobs": [{"name": "nightly", "skills": ["work-external"]}]})
+
+    assert names(client.get("/skills")) == []
+    assert names(client.get("/skills", params={"profile": "work"})) == ["work-external"]
+    assert client.get("/skills/work-external", params={"profile": "work"}).json()["used_by_crons"] == ["nightly"]
+
+
+def test_cron_category_can_come_from_an_external_skill(client, home, tmp_path_factory):
+    team = tmp_path_factory.mktemp("team")
+    write_skill(team, "ops/rotate-logs")
+    write_config(home, f"skills:\n  external_dirs: [{team}]\n")
+    write_json(home / "cron" / "jobs.json", {"jobs": [{"name": "rotate", "skills": ["rotate-logs"]}]})
+
+    assert client.get("/crons").json()["jobs"][0]["category"] == "ops"
+
+
 @pytest.mark.parametrize(
     "content, fragment",
     [

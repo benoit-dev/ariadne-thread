@@ -22,26 +22,27 @@ The source had no subprocess or shell calls and no outbound network calls. It re
 
 ### Filesystem reads
 
-All reads stay inside Hermes's own home. The plugin keeps no data of its own.
+Reads stay inside Hermes's own home, plus any skill folders that the user lists under `skills.external_dirs` in `config.yaml`. The plugin keeps no data of its own.
 
 | Location | Reads |
 |---|---|
-| `dashboard/plugin_api.py:652` | `<home>/cron/jobs.json` |
-| `dashboard/plugin_api.py:752` | `<home>/webhook_subscriptions.json`. The `secret` field is never returned. |
-| `dashboard/plugin_api.py:106`, `:821`, `:861` | Every `SKILL.md` under `<home>/skills/`, following symlinked folders |
-| `dashboard/plugin_api.py:87`, `:972` | The list of folders in `<hermes root>/profiles/`, and the three sources above for a profile picked with `?profile=` |
+| `dashboard/plugin_api.py:701` | `<home>/cron/jobs.json` |
+| `dashboard/plugin_api.py:801` | `<home>/webhook_subscriptions.json`. The `secret` field is never returned. |
+| `dashboard/plugin_api.py:137`, `:870`, `:908` | Every `SKILL.md` under `<home>/skills/` and under each external skill folder, following symlinked folders |
+| `dashboard/plugin_api.py:102-110` | `<home>/config.yaml`, for the `skills.external_dirs` list only. Entries expand `~` and `${VAR}` the way Hermes does. |
+| `dashboard/plugin_api.py:88`, `:1019` | The list of folders in `<hermes root>/profiles/`, and the sources above for a profile picked with `?profile=` |
 
 ### Filesystem writes
 
 | Location | Writes | Guard |
 |---|---|---|
-| `dashboard/plugin_api.py:915-925` | One `SKILL.md` that the user edited, by temp file and rename in the same folder | Active profile only. The real path must be inside `<home>/skills/`. The content must pass the same frontmatter checks as Hermes's skill manager. |
+| `dashboard/plugin_api.py:960-970` | One `SKILL.md` that the user edited, by temp file and rename in the same folder | Active profile only. Skills from external folders are read-only. The real path must be inside `<home>/skills/`. The content must pass the same frontmatter checks as Hermes's skill manager. |
 
 ### Network
 
 | Location | Call |
 |---|---|
-| `dashboard/plugin_api.py:940` | `broadcast_plugin_event` pushes `plugin.ariadne-thread.skills.changed` to connected Desktop windows. This is local and goes through Hermes. |
+| `dashboard/plugin_api.py:985` | `broadcast_plugin_event` pushes `plugin.ariadne-thread.skills.changed` to connected Desktop windows. This is local and goes through Hermes. |
 | `desktop/plugin.js` (all `ctx.rest` calls) | The plugin's own API at `/api/plugins/ariadne-thread/` through the Desktop SDK |
 
 The plugin calls no third-party service and sends no telemetry.

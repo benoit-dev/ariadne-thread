@@ -37,9 +37,9 @@ Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
 
 - **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a skill step to open the skill.
 - **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow.
-- **Skills** lists the skills in your skills folder, grouped by category folder, with a step count. Select a skill to see its flow, its related skills, the crons that use it, and its `SKILL.md`.
+- **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. Select a skill to see its flow, its related skills, the crons that use it, and its `SKILL.md`.
 
-Use the profile menu in the header to look at another profile. Other profiles are read-only.
+Use the profile menu in the header to look at another profile. Other profiles are read-only. Skills from `skills.external_dirs` are also read-only and show an **external** badge. If a local skill and an external skill have the same name, the local one wins, as it does in Hermes.
 
 To change a skill yourself, click **Edit**, change the `SKILL.md`, and click **Save**. The plugin checks the frontmatter before it writes.
 
@@ -58,9 +58,10 @@ It reads:
 - `cron/jobs.json`
 - `webhook_subscriptions.json`. Webhook secrets are never sent to the UI.
 - every `SKILL.md` under `skills/`, including skill folders that are symlinks to shared folders
-- the folder names in `profiles/`, and the same three sources inside a profile when you pick it
+- `config.yaml`, only to find `skills.external_dirs`, and every `SKILL.md` in those folders
+- the folder names in `profiles/`, and the same sources inside a profile when you pick it
 
-It writes only one thing. When you click **Save** in the editor, it replaces that skill's `SKILL.md` through a temporary file in the same folder. It writes only skills of the active profile whose real path is inside `skills/`.
+It writes only one thing. When you click **Save** in the editor, it replaces that skill's `SKILL.md` through a temporary file in the same folder. It writes only skills of the active profile whose real path is inside `skills/`. It never writes to external skill folders.
 
 It does not:
 
@@ -90,6 +91,27 @@ hermes plugins doctor . --ci
 ```
 
 [docs/validation.md](docs/validation.md) has the output for this version.
+
+### Try external skill folders by hand
+
+1. Create a folder with one skill in it:
+
+    ```sh
+    mkdir -p ~/team-skills/ops/rotate-logs
+    printf -- '---\nname: rotate-logs\ndescription: Rotate old logs\n---\n\n1. Find logs older than 7 days.\n2. Compress them.\n' > ~/team-skills/ops/rotate-logs/SKILL.md
+    ```
+
+2. Add the folder to `~/.hermes/config.yaml`:
+
+    ```yaml
+    skills:
+      external_dirs:
+        - ~/team-skills
+    ```
+
+3. Open the **Skills** tab. `rotate-logs` appears under `ops` with 2 steps and an **external** badge, and it has no **Edit** button.
+
+4. Run `hermes skills list` and check that Hermes lists the same skill.
 
 ## License
 
