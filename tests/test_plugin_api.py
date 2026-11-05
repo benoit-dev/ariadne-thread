@@ -725,3 +725,68 @@ def test_step_shape_matches_what_the_pipeline_renders(api):
         for step in api.parse_skill_flow({}, body)["steps"]:
             assert set(step) >= {"type", "kind", "kindLabel", "label", "detail"}
             assert step["kind"] in {"agent", "script", "skill"}
+
+
+def test_script_steps_name_the_script_and_prompts_carry_their_full_text(client, home):
+    long_prompt = "Summarize everything. " * 20
+    write_json(
+        home / "cron" / "jobs.json",
+        {"jobs": [
+            {"name": "snap", "script": "snapshot.py", "no_agent": True},
+            {"name": "gate", "script": "gate.sh", "prompt": long_prompt},
+        ]},
+    )
+
+    jobs = {j["name"]: j for j in client.get("/crons").json()["jobs"]}
+
+    (snap,) = jobs["snap"]["sequence"]
+    assert (snap["kind"], snap["script"]) == ("deterministic", "snapshot.py")
+    script, prompt = jobs["gate"]["sequence"]
+    assert (script["kind"], script["script"]) == ("script", "gate.sh")
+    assert prompt["body"] == long_prompt and len(prompt["detail"]) == 80
+
+
+def test_scripts_are_read_from_the_profile_scripts_folder(client, home):
+    scripts = home / "scripts"
+    (scripts / "sub").mkdir(parents=True)
+    (scripts / "snapshot.py").write_text("print('hi')\n")
+    (scripts / "sub" / "x.sh").write_text("echo x\n")
+
+    body = client.get("/scripts", params={"path": "snapshot.py"}).json()
+    assert (body["name"], body["content"], body["truncated"]) == ("snapshot.py", "print('hi')\n", False)
+    assert client.get("/scripts", params={"path": "sub/x.sh"}).json()["content"] == "echo x\n"
+    assert client.get("/scripts", params={"path": "~/.hermes/scripts/snapshot.py"}).status_code == 200
+    assert client.get("/scripts", params={"path": str(scripts / "snapshot.py")}).status_code == 200
+    assert client.get("/scripts", params={"path": "missing.py"}).status_code == 404
+
+
+def test_scripts_outside_the_scripts_folder_are_refused(client, home, tmp_path_factory):
+    (home / "scripts").mkdir()
+    (home / ".env").write_text("TOKEN=x")
+    outside = tmp_path_factory.mktemp("outside") / "evil.py"
+    outside.write_text("secret")
+    (home / "scripts" / "link.py").symlink_to(outside)
+
+    for path in ("../.env", str(outside), "link.py", "~/.hermes/.env"):
+        response = client.get("/scripts", params={"path": path})
+        assert response.status_code == 403, path
+        assert "secret" not in response.text and "TOKEN" not in response.text
+
+
+def test_large_scripts_are_truncated(client, home, api):
+    (home / "scripts").mkdir()
+    (home / "scripts" / "big.py").write_text("x" * (api.MAX_SCRIPT_BYTES + 10))
+
+    body = client.get("/scripts", params={"path": "big.py"}).json()
+
+    assert body["truncated"] is True
+    assert len(body["content"]) == api.MAX_SCRIPT_BYTES
+    assert body["size"] == api.MAX_SCRIPT_BYTES + 10
+
+
+def test_flow_steps_carry_their_section_text(api):
+    result = flow(api, "## Step 1: Fetch\nRun this:\n\n```bash\ncurl x\n```\n## Step 2: Report\nDone.\n")
+
+    first, second = result["steps"]
+    assert "curl x" in first["body"]
+    assert second["body"] == "Done."

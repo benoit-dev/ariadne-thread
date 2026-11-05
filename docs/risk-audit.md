@@ -29,6 +29,7 @@ Reads stay inside Hermes's own home, plus any skill folders that the user lists 
 | `dashboard/plugin_api.py:701` | `<home>/cron/jobs.json` |
 | `dashboard/plugin_api.py:801` | `<home>/webhook_subscriptions.json`. The `secret` field is never returned. |
 | `dashboard/plugin_api.py:137`, `:870`, `:908` | Every `SKILL.md` under `<home>/skills/` and under each external skill folder, following symlinked folders |
+| `dashboard/plugin_api.py:1023-1060` | One file under `<home>/scripts/`, when the user clicks a script step. Paths resolve the way Hermes resolves cron and webhook scripts; anything that resolves outside `<home>/scripts/` (`..`, absolute paths, symlinks) gets HTTP 403. At most 256 KB is returned. |
 | `dashboard/plugin_api.py:102-110` | `<home>/config.yaml`, for the `skills.external_dirs` list only. Entries expand `~` and `${VAR}` the way Hermes does. |
 | `dashboard/plugin_api.py:88`, `:1019` | The list of folders in `<hermes root>/profiles/`, and the sources above for a profile picked with `?profile=` |
 
