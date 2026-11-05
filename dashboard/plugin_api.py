@@ -531,7 +531,7 @@ def _step(doc: _Doc, label: str, detail: str, a: int, b: int) -> dict:
     elif doc.has_code_block(a, b) or _has_inline_command(doc.prose(a, b)):
         kind = "script"
     else:
-        kind = "agent"
+        kind = "prompt"
     # span: the body lines [a, b) this step came from, so PUT /skills/{name}/span can edit just them.
     step = {"type": kind, "kind": kind, "kindLabel": kind, "label": label, "detail": detail,
             "body": doc.span(a, b).strip(), "span": [a, b]}
@@ -596,7 +596,7 @@ def _by_sections(doc: _Doc) -> list[dict]:
 def _whole_skill(doc: _Doc) -> list[dict]:
     label = _plain(str(doc.fm.get("name") or "")) or "Skill"
     detail = _clip(_plain(str(doc.fm.get("description") or "")), MAX_DETAIL)
-    return [{"type": "agent", "kind": "agent", "kindLabel": "agent", "label": label, "detail": detail}]
+    return [{"type": "prompt", "kind": "prompt", "kindLabel": "prompt", "label": label, "detail": detail}]
 
 
 class _Strategy(NamedTuple):
@@ -677,14 +677,13 @@ def _cron_sequence(j: dict, skills: list[str]) -> list[dict]:
     prompt = j.get("prompt") or ""
     sequence = []
     if j.get("script"):
-        kind = "deterministic" if j.get("no_agent") else "script"
         sequence.append(
-            {"type": "script", "kind": kind, "kindLabel": kind,
+            {"type": "script", "kind": "script", "kindLabel": "script",
              "label": j["script"], "name": j["script"], "script": str(j["script"])}
         )
     if prompt and not j.get("no_agent"):
         sequence.append(
-            {"type": "prompt", "kind": "agent", "kindLabel": "agent",
+            {"type": "prompt", "kind": "prompt", "kindLabel": "prompt",
              "label": "Prompt", "detail": prompt[:80], "body": prompt}
         )
     for s in skills:
@@ -795,14 +794,14 @@ def _webhook_sequence(name: str, route: dict) -> list[dict]:
     }]
     if route.get("script"):
         steps.append({
-            "type": "script", "kind": "deterministic",
+            "type": "script", "kind": "script",
             "label": "Script", "detail": str(route["script"]),
-            "kindLabel": "deterministic", "script": str(route["script"]),
+            "kindLabel": "script", "script": str(route["script"]),
         })
     prompt = route.get("prompt") or ""
     steps.append({
-        "type": "prompt", "kind": "agent", "label": "Prompt template",
-        "detail": prompt[:200], "kindLabel": "agent", "body": prompt,
+        "type": "prompt", "kind": "prompt", "label": "Prompt",
+        "detail": prompt[:200], "kindLabel": "prompt", "body": prompt,
     })
     for skill in _string_list(route.get("skills")):
         steps.append({
