@@ -3,7 +3,7 @@
   "label": "Ariadne's Thread",
   "description": "n8n-style flows for your Hermes skills and crons.",
   "icon": "Workflow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tab": {
     "path": "/ariadne-thread",
     "hidden": true

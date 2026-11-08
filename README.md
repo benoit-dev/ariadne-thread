@@ -35,9 +35,16 @@ Restart Hermes Desktop, or rescan plugins, so that it loads the Desktop page. Th
 
 Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
 
-- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow. Click a step to expand it in place: a script step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step shows where each target in `deliver` resolves (platform, chat and thread, by the scheduler's own rules), or why it sends nothing, such as a platform with no home channel. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
+- **Crons** lists the jobs in `cron/jobs.json` with their status and schedule. Select a job to see its flow.
+  - A health bar at the top counts jobs that are ok, in error, blocked, paused, with a delivery error, and with no skill or script. It also counts **other** and **never run** jobs when there are any. Click a count to show only those jobs, and click it again to show all.
+  - The status is the scheduler's own `last_status`. A status other than `ok` shows next to the job's name exactly as Hermes wrote it, such as `blocked_config` or `delivery_failed`. A status the plugin does not know is never shown as ok. A job that has not run yet shows `never`.
+  - The selected job lists its problems: the last error, how many runs in a row have failed, why and since when it is paused, and the last delivery error.
+  - **Config** shows when the job runs next (relative and as a date), then its `model`, `provider`, `enabled_toolsets`, `profile`, `workdir`, `context_from`, `repeat` and `no_agent`, when set. It never shows `base_url`, and it hides any value that looks like a key, a token, or a URL with a password in it.
+  - **Thread** shows the skills the job loads and where its output goes. Click a skill to open it.
+  - **Runs** lists the latest output files Hermes saved for the job in `cron/output/<job id>/`, with their time and size. Click one to read it. At most the first 256 KB is shown.
+ Click a step to expand it in place: a script step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step shows where each target in `deliver` resolves (platform, chat and thread, by the scheduler's own rules), or why it sends nothing, such as a platform with no home channel. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
 - **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow. Its steps open the same way.
-- **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. A selected skill has two views: **Workflow** shows its flow, its related skills and the crons that use it, and **SKILL.md** shows the whole file.
+- **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. A selected skill has two views: **Workflow** shows its flow, its related skills, and **Used by**, which lists every cron and webhook that loads the skill with the cron's status and where each one delivers. **SKILL.md** shows the whole file.
 
 Use the profile menu in the header to look at another profile. Other profiles are read-only. Skills from `skills.external_dirs` are also read-only and show an **external** badge. If a local skill and an external skill have the same name, the local one wins, as it does in Hermes.
 
@@ -54,7 +61,15 @@ An expanded step has an **Edit** button. It turns the step into a text box; **Sa
 
 Scripts show with line numbers and syntax colours (Python, shell and JavaScript, picked by extension or shebang), and edit in a code editor: Tab and Shift+Tab indent or dedent the selected lines, Enter keeps the line's indent (one level more after a Python `:` or an opening bracket), and Backspace in leading spaces removes one indent level.
 
+When you edit a skill, the line next to **Save** says what the change reaches, such as "Saving affects 3: daily-digest, triage, gh-issues", or that no cron or webhook uses the skill.
+
 Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Trigger steps and webhook deliver steps are read-only.
+
+### Undo an edit
+
+Before each save, Ariadne's Thread keeps a copy of the text it is about to replace. This covers a whole `SKILL.md`, one skill step, a script, a cron prompt, a cron's delivery targets, and a webhook prompt. A skill step edit keeps the whole `SKILL.md`. The last 10 copies of each are kept, and older ones are deleted.
+
+An editable step has a **History** button next to **Edit**. It lists the saved copies by time. Pick one to see a diff against the current text, then click **Revert to this version** to write it back. A revert is a save, so it goes through the same checks: it is refused if the text changed since you opened the diff, and it keeps a copy of the text it replaces, so you can undo the revert too. History is available in the active profile only.
 
 ### Ask an agent
 
@@ -66,29 +81,38 @@ The parser reads step headings (`## Step 1`), an ordered list under a heading su
 
 ## What this plugin reads and writes
 
-Ariadne's Thread reads files that Hermes keeps in its home folder (`HERMES_HOME`, `~/.hermes` by default). It keeps no data of its own.
+Ariadne's Thread reads files that Hermes keeps in its home folder (`HERMES_HOME`, `~/.hermes` by default). The only data of its own is the edit history in `plugin-data/ariadne-thread/history/` inside that folder. This is the per-plugin folder Hermes sets aside for plugins.
 
 It reads:
 
 - `cron/jobs.json`
+- the run output files in `cron/output/<job id>/`, when you open a job's **Runs**. It lists only files named like `2026-11-08_09-00-00.md`, refuses any path that resolves outside that job's folder, and shows at most the first 256 KB.
 - `webhook_subscriptions.json`. Webhook secrets are never sent to the UI.
 - every `SKILL.md` under `skills/`, including skill folders that are symlinks to shared folders
 - `config.yaml`, only to find `skills.external_dirs`, and every `SKILL.md` in those folders
 - a script in `scripts/` when you click a script step, the same folder Hermes runs cron and webhook scripts from. It refuses paths that resolve outside that folder and shows at most the first 256 KB. The script is shown as it is, so anything written into it is visible on screen.
 - the folder names in `profiles/`, and the same sources inside a profile when you pick it
+- its own history files in `plugin-data/ariadne-thread/history/`, when you open **History**
 
 It writes only when you click **Save**, and only in the active profile:
 
 - a skill's `SKILL.md`, whole or one step's lines, through a temporary file in the same folder. Only skills whose real path is inside `skills/`; never external skill folders.
 - a script in `scripts/`, through a temporary file, keeping its file mode. Paths outside `scripts/` are refused.
 - a cron job's `prompt`, through Hermes' own cron store (`cron.jobs.update_job`), which takes the same lock as the scheduler.
+- a cron job's `deliver`, through the same cron store.
 - a webhook route's `prompt`, through Hermes' own webhook store, which takes the same lock as the gateway and keeps the route's secret.
+- before each of these writes, one history file in `plugin-data/ariadne-thread/history/<kind>/<hash of the target>/`. It holds the replaced text, its kind and target name, and the time. It is written through a temporary file with mode `0600` in folders with mode `0700`. The plugin keeps the newest 10 per target and deletes older ones. For a webhook it stores only the prompt, never the secret or the rest of the route. If the history file cannot be written, the save is refused and nothing changes.
+
+A revert from **History** writes through the same paths as a save.
 
 Every save is refused if the text on disk no longer matches what you started editing.
+
+To clear the history, delete `plugin-data/ariadne-thread/`. Uninstalling the plugin does not delete it.
 
 It does not:
 
 - run shell commands or start processes
+- run, pause, or resume cron jobs. **Runs** only reads the output files Hermes already wrote.
 - start agent sessions or send messages for you
 - call any network service other than the Hermes backend it is installed in
 - read credentials, `.env` files, or tokens
