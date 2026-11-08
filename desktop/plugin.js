@@ -800,12 +800,21 @@ function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron }) {
     view === 'md'
       ? h(
           'div',
-          { key: 'md', style: { marginTop: '16px' } },
+          { key: 'md:' + detail.name, style: { marginTop: '16px' } },
           h(TextEditor, {
             value: detail.raw,
             hint: 'Full SKILL.md: YAML frontmatter (--- … ---) then the markdown body. Validated on save.',
             onSave: editable
               ? (content, expected) => save(ctx, '/skills/' + encodeURIComponent(detail.name), { content, expected }, detail.name)
+              : null,
+            ask: editable
+              ? (close) =>
+                  h(AgentBox, {
+                    ctx,
+                    buildPrompt: (request) => skillPrompt(detail, request),
+                    onClose: close,
+                    placeholder: 'e.g. reword the description, add a pitfall, restructure…',
+                  })
               : null,
           })
         )
@@ -940,19 +949,7 @@ function SkillsTab({ ctx, profile, nav, onNavigate }) {
                 profile,
               })
             : null)
-      : h(Note, { text: 'Select a skill' }),
-    detail.data && detail.data.editable && canEdit(profile)
-      ? h(
-          'div',
-          { style: { margin: '16px -16px -16px', padding: '12px 16px', borderTop: '1px solid ' + STROKE } },
-          h(AgentBox, {
-            key: detail.data.name,
-            ctx,
-            buildPrompt: (request) => skillPrompt(detail.data, request),
-            placeholder: 'e.g. reword the description, add a pitfall, restructure…',
-          })
-        )
-      : null
+      : h(Note, { text: 'Select a skill' })
   )
 }
 
