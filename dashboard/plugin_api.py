@@ -1,39 +1,54 @@
 """Ariadne's Thread: backend API for the Hermes Desktop plugin.
 
 Read-only views over the files Hermes already keeps, plus guarded editing of
-the active profile's own skills, scripts, cron prompts and webhook prompts:
+the active profile's own skills, scripts, cron prompts and webhook prompts.
+Nothing here runs a job, a script or a skill, and nothing is sent anywhere:
 
-  GET  /health                 -> {ok, name, version, sources}
-  GET  /profiles               -> {profiles}
-  GET  /crons                  -> {jobs, total, categories, updated_at}
-  GET  /webhooks               -> {routes}
-  GET  /skills                 -> {skills, count}
-  GET  /skills/{name}          -> skill detail, raw SKILL.md and its parsed flow
-  GET  /scripts?path=...       -> a cron or webhook script from <home>/scripts
-  PUT  /skills/{name}          -> edit a skill (validated, atomic write)
-  PUT  /skills/{name}/span     -> edit the lines of one flow step
-  PUT  /scripts                -> edit a script in <home>/scripts
-  PUT  /crons/{id}/prompt      -> edit a cron job's prompt
-  PUT  /webhooks/{name}/prompt -> edit a webhook route's prompt
+  GET  /health                       -> {ok, name, version, sources}
+  GET  /profiles                     -> {profiles}
+  GET  /crons                        -> {jobs, total, categories, updated_at}; each job has its
+                                        true run status, health, config and issues
+  GET  /crons/{id}/delivery          -> where each deliver token resolves to
+  GET  /crons/{id}/runs              -> the run output files Hermes saved, newest first
+  GET  /crons/{id}/runs/{run_id}     -> one run's output
+  GET  /webhooks                     -> {routes}
+  GET  /skills                       -> {skills, count}
+  GET  /skills/{name}                -> skill detail, raw SKILL.md, its parsed flow and used_by
+  GET  /scripts?path=...             -> a cron or webhook script from <home>/scripts, with its history ref
+  GET  /history?kind=&ref=           -> the saved earlier versions of one edited text
+  GET  /history/version?...&id=      -> one earlier version beside the current text and a diff
+  PUT  /skills/{name}                -> edit a skill (validated, atomic write)
+  PUT  /skills/{name}/span           -> edit the lines of one flow step
+  PUT  /scripts                      -> edit a script in <home>/scripts
+  PUT  /crons/{id}/prompt            -> edit a cron job's prompt
+  PUT  /crons/{id}/deliver           -> edit a cron job's delivery target
+  PUT  /webhooks/{name}/prompt       -> edit a webhook route's prompt
+  POST /history/revert               -> write an earlier version back through the matching PUT
 
 Every edit carries the text the user started from and gets 409 if the file
-changed since. The read endpoints take an optional ?profile=<name> to look at
-another profile's files read-only. Paths are resolved per request because this module
-can be served from a profile-scoped host process.
+changed since. Every edit first saves the text it replaces under
+<home>/plugin-data/ariadne-thread/history, so it can be undone. The read endpoints
+take an optional ?profile=<name> to look at another profile's files read-only. Paths
+are resolved per request because this module can be served from a profile-scoped host
+process.
 
-Webhook HMAC secrets are never serialized.
+Webhook HMAC secrets are never serialized, and never stored in the history.
 """
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import logging
 import os
 import re
 import stat
 import tempfile
+import time
 from bisect import bisect_right
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
@@ -62,12 +77,17 @@ router = APIRouter()
 _log = logging.getLogger("ariadne-thread")
 
 PLUGIN_NAME = "ariadne-thread"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_SCRIPT_BYTES = 256 * 1024
+HISTORY_KEEP = 10
 
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_JOB_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_RUN_ID_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}")
+_RUN_FILE_RE = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2})\.md")
+_HISTORY_ID_RE = re.compile(r"[0-9]{20}")
 
 # Mirrors the directories Hermes itself skips when it discovers skills, so a
 # template or a cached copy is not listed as a second skill.
@@ -80,6 +100,7 @@ _SUPPORT_DIRS = frozenset({"references", "templates", "assets", "scripts"})
 
 
 class Roots(NamedTuple):
+    home: Path
     skills: Path
     scripts: Path
     cron_jobs: Path
@@ -100,6 +121,7 @@ def _profile_roots(profile: Optional[str]) -> Roots:
         editable = False
     skills = home / "skills"
     return Roots(
+        home=home,
         skills=skills,
         scripts=home / "scripts",
         cron_jobs=home / "cron" / "jobs.json",
@@ -142,6 +164,27 @@ def _read_json(path: Path, label: str):
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{label} unreadable: {exc}")
+
+
+def _json_or_none(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+
+
+def _text_or_none(path: Path) -> Optional[str]:
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _checked(value: str, pattern: re.Pattern, what: str) -> str:
+    """The boundary check for an id that becomes part of a file name."""
+    if not pattern.fullmatch(value) or ".." in value:
+        raise HTTPException(status_code=400, detail=f"invalid {what}: {value!r}")
+    return value
 
 
 def _skill_files(root: Path) -> list[Path]:
@@ -717,6 +760,85 @@ def _jobs_of(live) -> list[dict]:
     return [j for j in raw if isinstance(j, dict)] if isinstance(raw, list) else []
 
 
+# What a job's last_status means for the health bar. Paused and never-run jobs have no
+# last_status to look up, and any value missing here is "other", never "ok".
+_STATUS_HEALTH = {"ok": "ok", "error": "error", "blocked_config": "blocked"}
+
+
+def _job_status(j: dict) -> tuple[str, str]:
+    """(status, health) of a job: the row text and the health bucket it counts in."""
+    if not j.get("enabled", True):
+        return ("completed", "other") if j.get("state") == "completed" else ("paused", "paused")
+    last = j.get("last_status")
+    if last in (None, ""):
+        return "never", "never"
+    return str(last), _STATUS_HEALTH.get(str(last), "other")
+
+
+def _count(value) -> int:
+    return value if type(value) is int and value > 0 else 0
+
+
+def _unattached(j: dict, skills: list[str]) -> bool:
+    return not skills and not j.get("script") and not j.get("no_agent")
+
+
+def _job_issues(j: dict, skills: list[str], status: str, health: str) -> list[str]:
+    issues = []
+    last_status = str(j.get("last_status") or status)
+    if j.get("last_error"):
+        issues.append(f"Last run {last_status}: {j['last_error']}")
+    elif health in ("error", "blocked", "other") and status != "completed":
+        issues.append(f"Last run {last_status}")
+    streak = _count(j.get("failure_streak"))
+    if streak:
+        issues.append(f"Failed {streak} run{'' if streak == 1 else 's'} in a row")
+    if health == "paused":
+        since, reason = j.get("paused_at"), j.get("paused_reason")
+        issues.append("Paused" + (f" since {since}" if since else "") + (f": {reason}" if reason else ""))
+    if j.get("last_delivery_error"):
+        issues.append(f"Delivery: {j['last_delivery_error']}")
+    if _unattached(j, skills):
+        issues.append("No skill or script attached")
+    return issues
+
+
+_CONFIG_KEYS = ("model", "provider", "enabled_toolsets", "profile", "workdir", "context_from", "repeat", "no_agent")
+_CREDENTIAL_RES = (
+    re.compile(r"\b(?:sk-|gh[opsu]_|xox[abprs]-|AKIA)[A-Za-z0-9_-]{4,}"),
+    re.compile(r"://[^/\s:@]+:[^/\s@]+@"),
+    re.compile(r"[?&][\w.-]*(?:key|token|secret|password)=", re.I),
+)
+_TOKEN_RUN_RE = re.compile(r"(?=[A-Za-z+/=]*[0-9])[A-Za-z0-9+/=]{32,}")
+
+
+def _looks_like_credential(text: str) -> bool:
+    if any(pattern.search(text) for pattern in _CREDENTIAL_RES):
+        return True
+    return not text.startswith(("/", "~", ".")) and bool(_TOKEN_RUN_RE.search(text))
+
+
+def _strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _strings(k)
+            yield from _strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _strings(v)
+
+
+def _job_config(j: dict) -> dict:
+    """The settings an operator reads off a job. A value that looks like a credential is dropped
+    whole, and base_url is not on the list at all."""
+    return {
+        key: j[key] for key in _CONFIG_KEYS
+        if j.get(key) and not any(_looks_like_credential(text) for text in _strings(j[key]))
+    }
+
+
 @router.get("/crons")
 def get_crons(profile: Optional[str] = Query(None)):
     roots = _profile_roots(profile)
@@ -744,18 +866,7 @@ def get_crons(profile: Optional[str] = Query(None)):
                 category = _category_of(ref.md, ref.root)
                 break
 
-        if not j.get("enabled", True):
-            status = "paused"
-        elif j.get("last_status") == "error":
-            status = "error"
-        else:
-            status = "ok"
-
-        issues = []
-        if j.get("last_delivery_error"):
-            issues.append(f"Delivery: {j['last_delivery_error']}")
-        if not skills and not j.get("script") and not j.get("no_agent"):
-            issues.append("No skill or script attached")
+        status, health = _job_status(j)
 
         jobs.append({
             "id": j.get("id"),
@@ -767,11 +878,21 @@ def get_crons(profile: Optional[str] = Query(None)):
             "script": j.get("script"),
             "no_agent": j.get("no_agent", False),
             "status": status,
+            "health": health,
+            "last_status": j.get("last_status"),
+            "last_error": j.get("last_error"),
+            "failure_streak": _count(j.get("failure_streak")),
+            "paused_reason": j.get("paused_reason"),
+            "paused_at": j.get("paused_at"),
+            "last_delivery_error": j.get("last_delivery_error"),
+            "next_run_at": j.get("next_run_at"),
+            "unattached": _unattached(j, skills),
+            "config": _job_config(j),
             "deliver": _deliver_text(j.get("deliver")),
             "workdir": j.get("workdir"),
             "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
             "prompt_full": prompt,
-            "issues": issues,
+            "issues": _job_issues(j, skills, status, health),
             "category": category,
             "sequence": _cron_sequence(j, skills),
             "last_run": j.get("last_run_at"),
@@ -868,19 +989,25 @@ def _related_skills(fm: dict, body: str) -> list[str]:
     return out
 
 
-def _used_by_crons(name: str, roots: Roots) -> list[str]:
-    if not roots.cron_jobs.exists():
-        return []
-    try:
-        live = json.loads(roots.cron_jobs.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return []
-    users = [
-        j.get("name") or "Unnamed"
-        for j in _jobs_of(live)
-        if name in (s.rsplit("/", 1)[-1] for s in _job_skills(j))
-    ]
-    return sorted(users)
+def _uses_skill(skills: list[str], name: str) -> bool:
+    return any(s.rsplit("/", 1)[-1] == name for s in skills)
+
+
+def _used_by(name: str, roots: Roots) -> list[dict]:
+    """The crons and webhook routes that attach a skill, so an edit shows what it reaches."""
+    users = []
+    for j in _jobs_of(_json_or_none(roots.cron_jobs)):
+        if _uses_skill(_job_skills(j), name):
+            status, health = _job_status(j)
+            users.append({
+                "kind": "cron", "id": j.get("id"), "name": j.get("name") or "Unnamed",
+                "deliver": _deliver_text(j.get("deliver")), "status": status, "health": health,
+            })
+    routes = _json_or_none(roots.webhooks)
+    for route_name, route in routes.items() if isinstance(routes, dict) else ():
+        if isinstance(route, dict) and _uses_skill(_string_list(route.get("skills")), name):
+            users.append({"kind": "webhook", "name": route_name, "deliver": route.get("deliver") or ""})
+    return sorted(users, key=lambda u: (u["kind"], u["name"]))
 
 
 class _Summary(NamedTuple):
@@ -945,7 +1072,7 @@ def get_skill(name: str, profile: Optional[str] = Query(None)):
         "body": body,
         "raw": text,
         "related_skills": _related_skills(fm, body),
-        "used_by_crons": _used_by_crons(name, roots),
+        "used_by": _used_by(name, roots),
         "flow": parse_skill_flow(fm, body),
     }
 
@@ -1007,6 +1134,50 @@ def _atomic_write(target: Path, content: str) -> None:
         raise HTTPException(status_code=500, detail=f"write failed: {exc}")
 
 
+def _history_folder(roots: Roots, kind: str, ref: str) -> Path:
+    key = hashlib.sha256(ref.encode("utf-8", "replace")).hexdigest()[:24]
+    return roots.home / "plugin-data" / PLUGIN_NAME / "history" / kind / key
+
+
+def _record_history(roots: Roots, kind: str, ref: str, old: str, new: str) -> None:
+    """Keep the text an edit is about to replace, so the edit can be undone. A save whose history
+    cannot be written fails before it touches the target."""
+    if old == new:
+        return
+    folder = _history_folder(roots, kind, ref)
+    tmp = None
+    try:
+        at = roots.home
+        for part in folder.relative_to(roots.home).parts:
+            at = at / part
+            at.mkdir(mode=0o700, exist_ok=True)
+        stamp = time.time_ns()
+        while (folder / f"{stamp:020d}.json").exists():
+            stamp += 1
+        entry = {
+            "kind": kind, "ref": ref, "id": f"{stamp:020d}",
+            "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "content": old,
+        }
+        fd, tmp = tempfile.mkstemp(dir=str(folder), prefix=".", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(entry, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, folder / f"{entry['id']}.json")
+    except Exception as exc:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=f"could not save the earlier version, nothing was changed: {exc}")
+    for stale in sorted(folder.glob("*.json"), reverse=True)[HISTORY_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            _log.warning("history entry not pruned: %s", stale)
+
+
 def _announce_skill_change(name: str) -> None:
     try:
         from hermes_cli.plugin_events import broadcast_plugin_event
@@ -1032,12 +1203,16 @@ def _writable_skill(name: str, roots: Roots) -> SkillRef:
     return ref
 
 
-def _save_skill(name: str, ref: SkillRef, content: str) -> dict:
+def _save_skill(name: str, ref: SkillRef, content: str, roots: Roots) -> dict:
     err = _validate_skill_content(content)
     if err:
         raise HTTPException(status_code=422, detail=err)
 
-    _atomic_write(Path(os.path.realpath(ref.md)), content)
+    real = Path(os.path.realpath(ref.md))
+    old = _text_or_none(real)
+    if old is not None:
+        _record_history(roots, "skill", name, old, content)
+    _atomic_write(real, content)
     _announce_skill_change(name)
 
     fm, _ = _split_frontmatter(content)
@@ -1055,7 +1230,7 @@ def put_skill(name: str, update: SkillUpdate, profile: Optional[str] = Query(Non
     ref = _writable_skill(name, roots)
     if update.expected is not None and ref.md.read_bytes().decode("utf-8", errors="replace") != update.expected:
         raise HTTPException(status_code=409, detail=f"SKILL.md {_CONFLICT}")
-    return _save_skill(name, ref, update.content)
+    return _save_skill(name, ref, update.content, roots)
 
 
 class SpanUpdate(BaseModel):
@@ -1102,7 +1277,12 @@ def put_skill_span(name: str, update: SpanUpdate, profile: Optional[str] = Query
     trail = old[len(old.rstrip()) :]
     new = re.sub(r"\r\n|\r|\n", newline, update.content.strip())
     spliced = "".join(parts[: 2 * update.start]) + lead + new + trail + "".join(parts[2 * update.end - 1 :])
-    return _save_skill(name, ref, text[:a] + spliced + text[b:])
+    return _save_skill(name, ref, text[:a] + spliced + text[b:], roots)
+
+
+def _script_ref(target: Path, roots: Roots) -> str:
+    """The history ref of a script: its path under <home>/scripts, however the job spelled it."""
+    return target.relative_to(roots.scripts.resolve()).as_posix()
 
 
 def _script_path(value: str, scripts: Path) -> Path:
@@ -1137,6 +1317,7 @@ def get_script(path: str = Query(...), profile: Optional[str] = Query(None)):
     return {
         "path": str(target),
         "name": target.name,
+        "ref": _script_ref(target, roots),
         "size": size,
         "truncated": len(data) > MAX_SCRIPT_BYTES,
         "content": data[:MAX_SCRIPT_BYTES].decode("utf-8", errors="replace"),
@@ -1166,6 +1347,7 @@ def put_script(update: ScriptUpdate, profile: Optional[str] = Query(None)):
         raise HTTPException(status_code=500, detail=f"unreadable: {exc}")
     if current != update.expected:
         raise HTTPException(status_code=409, detail=f"The script {_CONFLICT}")
+    _record_history(roots, "script", _script_ref(target, roots), current, update.content)
     _atomic_write(target, update.content)
     return {"ok": True, "path": str(target)}
 
@@ -1260,12 +1442,19 @@ def _delivery_options() -> list[dict]:
     return options
 
 
-def _find_job(roots: Roots, job_id: str) -> dict:
+def _job_or_none(roots: Roots, job_id: str) -> Optional[dict]:
     if roots.cron_jobs.exists():
         for j in _jobs_of(_read_json(roots.cron_jobs, "jobs.json")):
             if str(j.get("id")) == job_id:
                 return j
-    raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
+    return None
+
+
+def _find_job(roots: Roots, job_id: str) -> dict:
+    job = _job_or_none(roots, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
+    return job
 
 
 @router.get("/crons/{job_id}/delivery")
@@ -1287,11 +1476,67 @@ def get_cron_delivery(job_id: str, profile: Optional[str] = Query(None)):
     return result
 
 
+def _run_dir(roots: Roots, job_id: str) -> Path:
+    return roots.home / "cron" / "output" / job_id
+
+
+def _run_at(run_id: str) -> str:
+    return f"{run_id[:10]}T{run_id[11:].replace('-', ':')}"
+
+
+@router.get("/crons/{job_id}/runs")
+def list_cron_runs(job_id: str, limit: int = Query(20, ge=1, le=200), profile: Optional[str] = Query(None)):
+    """The output files Hermes saved for a job, newest first."""
+    _checked(job_id, _JOB_ID_RE, "job id")
+    folder = _run_dir(_profile_roots(profile), job_id)
+    found: list[tuple[str, int]] = []
+    for entry in folder.iterdir() if folder.is_dir() else ():
+        match = _RUN_FILE_RE.fullmatch(entry.name)
+        try:
+            st = entry.lstat()
+        except OSError:
+            continue
+        if match and stat.S_ISREG(st.st_mode):
+            found.append((match.group(1), st.st_size))
+    found.sort(reverse=True)
+    return {
+        "job_id": job_id,
+        "runs": [{"id": run_id, "at": _run_at(run_id), "size": size} for run_id, size in found[:limit]],
+        "total": len(found),
+    }
+
+
+@router.get("/crons/{job_id}/runs/{run_id}")
+def get_cron_run(job_id: str, run_id: str, profile: Optional[str] = Query(None)):
+    _checked(job_id, _JOB_ID_RE, "job id")
+    _checked(run_id, _RUN_ID_RE, "run id")
+    folder = _run_dir(_profile_roots(profile), job_id)
+    path = folder / f"{run_id}.md"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+    if not _within(path, folder):
+        raise HTTPException(status_code=403, detail="this run file resolves outside the job's output folder")
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(MAX_SCRIPT_BYTES + 1)
+        size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"unreadable: {exc}")
+    return {
+        "job_id": job_id,
+        "id": run_id,
+        "at": _run_at(run_id),
+        "size": size,
+        "truncated": len(data) > MAX_SCRIPT_BYTES,
+        "content": data[:MAX_SCRIPT_BYTES].decode("utf-8", errors="replace"),
+    }
+
+
 # Cron jobs and webhook routes are written through Hermes' own store functions, which hold
 # the same locks as the scheduler and the gateway, so an edit here cannot race a run.
 @router.put("/crons/{job_id}/prompt")
 def put_cron_prompt(job_id: str, update: TextUpdate, profile: Optional[str] = Query(None)):
-    _editable_roots(profile, "cron jobs")
+    roots = _editable_roots(profile, "cron jobs")
     from cron import jobs as cron_jobs
 
     job = cron_jobs.get_job(job_id)
@@ -1299,6 +1544,7 @@ def put_cron_prompt(job_id: str, update: TextUpdate, profile: Optional[str] = Qu
         raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
     if (job.get("prompt") or "") != update.expected:
         raise HTTPException(status_code=409, detail=f"The prompt {_CONFLICT}")
+    _record_history(roots, "cron-prompt", job_id, job.get("prompt") or "", update.content)
     try:
         cron_jobs.update_job(job_id, {"prompt": update.content})
     except ValueError as exc:
@@ -1308,7 +1554,7 @@ def put_cron_prompt(job_id: str, update: TextUpdate, profile: Optional[str] = Qu
 
 @router.put("/crons/{job_id}/deliver")
 def put_cron_deliver(job_id: str, update: TextUpdate, profile: Optional[str] = Query(None)):
-    _editable_roots(profile, "cron jobs")
+    roots = _editable_roots(profile, "cron jobs")
     from cron import jobs as cron_jobs
 
     job = cron_jobs.get_job(job_id)
@@ -1319,6 +1565,7 @@ def put_cron_deliver(job_id: str, update: TextUpdate, profile: Optional[str] = Q
     # "local" only means "send nowhere", so next to a real target it is dropped.
     tokens = dict.fromkeys(t.strip() for t in update.content.split(",") if t.strip() and t.strip() != "local")
     deliver = ",".join(tokens) or "local"
+    _record_history(roots, "cron-deliver", job_id, _deliver_text(job.get("deliver")), deliver)
     try:
         cron_jobs.update_job(job_id, {"deliver": deliver})
     except ValueError as exc:
@@ -1328,7 +1575,7 @@ def put_cron_deliver(job_id: str, update: TextUpdate, profile: Optional[str] = Q
 
 @router.put("/webhooks/{name}/prompt")
 def put_webhook_prompt(name: str, update: TextUpdate, profile: Optional[str] = Query(None)):
-    _editable_roots(profile, "webhooks")
+    roots = _editable_roots(profile, "webhooks")
     try:
         from hermes_cli.webhook import SubscriptionMutationConflict, _load_subscriptions, _replace_subscription
     except ImportError:
@@ -1338,11 +1585,140 @@ def put_webhook_prompt(name: str, update: TextUpdate, profile: Optional[str] = Q
         raise HTTPException(status_code=404, detail=f"webhook route not found: {name}")
     if (route.get("prompt") or "") != update.expected:
         raise HTTPException(status_code=409, detail=f"The prompt {_CONFLICT}")
+    _record_history(roots, "webhook-prompt", name, route.get("prompt") or "", update.content)
     try:
         _replace_subscription(name, {**route, "prompt": update.content}, route)
     except SubscriptionMutationConflict:
         raise HTTPException(status_code=409, detail=f"The route {_CONFLICT}")
     return {"ok": True, "name": name}
+
+
+class _HistoryKind(NamedTuple):
+    current: Callable[[str, Roots], Optional[str]]
+    write: Callable[[str, str, str], dict]
+
+
+def _skill_current(ref: str, roots: Roots) -> Optional[str]:
+    found = _skill_index(roots).get(ref)
+    return None if found is None else _text_or_none(found.md)
+
+
+def _script_current(ref: str, roots: Roots) -> Optional[str]:
+    try:
+        return _text_or_none(_script_path(ref, roots.scripts))
+    except HTTPException:
+        return None
+
+
+def _cron_prompt_current(ref: str, roots: Roots) -> Optional[str]:
+    job = _job_or_none(roots, ref)
+    return None if job is None else job.get("prompt") or ""
+
+
+def _cron_deliver_current(ref: str, roots: Roots) -> Optional[str]:
+    job = _job_or_none(roots, ref)
+    return None if job is None else _deliver_text(job.get("deliver"))
+
+
+def _webhook_prompt_current(ref: str, roots: Roots) -> Optional[str]:
+    routes = _json_or_none(roots.webhooks)
+    route = routes.get(ref) if isinstance(routes, dict) else None
+    return route.get("prompt") or "" if isinstance(route, dict) else None
+
+
+# A revert is a save through the same PUT handler, so it is conflict-checked and recorded like one.
+_HISTORY_KINDS: dict[str, _HistoryKind] = {
+    "skill": _HistoryKind(
+        _skill_current,
+        lambda ref, expected, content: put_skill(ref, SkillUpdate(content=content, expected=expected), None),
+    ),
+    "script": _HistoryKind(
+        _script_current,
+        lambda ref, expected, content: put_script(ScriptUpdate(path=ref, expected=expected, content=content), None),
+    ),
+    "cron-prompt": _HistoryKind(
+        _cron_prompt_current,
+        lambda ref, expected, content: put_cron_prompt(ref, TextUpdate(expected=expected, content=content), None),
+    ),
+    "cron-deliver": _HistoryKind(
+        _cron_deliver_current,
+        lambda ref, expected, content: put_cron_deliver(ref, TextUpdate(expected=expected, content=content), None),
+    ),
+    "webhook-prompt": _HistoryKind(
+        _webhook_prompt_current,
+        lambda ref, expected, content: put_webhook_prompt(ref, TextUpdate(expected=expected, content=content), None),
+    ),
+}
+
+
+def _history_kind(kind: str) -> _HistoryKind:
+    found = _HISTORY_KINDS.get(kind)
+    if found is None:
+        raise HTTPException(status_code=400, detail=f"unknown history kind: {kind!r}")
+    return found
+
+
+def _history_entry(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"history entry unreadable: {exc}")
+
+
+@router.get("/history")
+def list_history(kind: str = Query(...), ref: str = Query(...), profile: Optional[str] = Query(None)):
+    _history_kind(kind)
+    folder = _history_folder(_profile_roots(profile), kind, ref)
+    versions = []
+    for path in sorted(folder.glob("*.json"), reverse=True) if folder.is_dir() else ():
+        entry = _history_entry(path)
+        if entry is not None:
+            versions.append({
+                "id": entry["id"], "saved_at": entry["saved_at"], "size": len(entry["content"].encode("utf-8")),
+            })
+    return {"kind": kind, "ref": ref, "versions": versions}
+
+
+@router.get("/history/version")
+def get_history_version(
+    kind: str = Query(...), ref: str = Query(...), id: str = Query(...), profile: Optional[str] = Query(None),
+):
+    handler = _history_kind(kind)
+    _checked(id, _HISTORY_ID_RE, "history id")
+    roots = _profile_roots(profile)
+    entry = _history_entry(_history_folder(roots, kind, ref) / f"{id}.json")
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"no saved version {id}")
+    current = handler.current(ref, roots)
+    diff = difflib.unified_diff(
+        (current or "").splitlines(), entry["content"].splitlines(), "current", f"version {entry['saved_at']}",
+        lineterm="",
+    )
+    return {
+        "kind": kind, "ref": ref, "id": id, "saved_at": entry["saved_at"],
+        "content": entry["content"], "current": current, "diff": "\n".join(diff),
+    }
+
+
+class RevertRequest(BaseModel):
+    kind: str
+    ref: str
+    id: str
+    expected: str
+
+
+@router.post("/history/revert")
+def revert_history(request: RevertRequest, profile: Optional[str] = Query(None)):
+    handler = _history_kind(request.kind)
+    _checked(request.id, _HISTORY_ID_RE, "history id")
+    roots = _editable_roots(profile, "history")
+    entry = _history_entry(_history_folder(roots, request.kind, request.ref) / f"{request.id}.json")
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"no saved version {request.id}")
+    result = handler.write(request.ref, request.expected, entry["content"])
+    return {**result, "reverted": request.id}
 
 
 @router.get("/profiles")

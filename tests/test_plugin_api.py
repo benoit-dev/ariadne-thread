@@ -6,12 +6,14 @@ Run with the Python that has Hermes installed:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import stat
 import sys
 from pathlib import Path
 from textwrap import dedent
+from typing import Callable, NamedTuple
 
 import pytest
 
@@ -84,7 +86,7 @@ def test_empty_home_has_empty_lists_and_no_errors(client):
     assert client.get("/profiles").json() == {"profiles": ["default"]}
     health = client.get("/health").json()
     assert health["name"] == "ariadne-thread"
-    assert health["version"] == "0.1.0"
+    assert health["version"] == "0.2.0"
     assert health["sources"] == {"crons": False, "webhooks": False, "skills_root": False}
 
 
@@ -295,7 +297,8 @@ def test_external_dirs_follow_the_selected_profile_config(client, home, tmp_path
 
     assert names(client.get("/skills")) == []
     assert names(client.get("/skills", params={"profile": "work"})) == ["work-external"]
-    assert client.get("/skills/work-external", params={"profile": "work"}).json()["used_by_crons"] == ["nightly"]
+    used_by = client.get("/skills/work-external", params={"profile": "work"}).json()["used_by"]
+    assert [(u["kind"], u["name"]) for u in used_by] == [("cron", "nightly")]
 
 
 def test_cron_category_can_come_from_an_external_skill(client, home, tmp_path_factory):
@@ -431,11 +434,34 @@ def test_cron_category_comes_from_the_first_attached_skill_that_exists(client, h
     assert jobs["notes"]["sequence"][-1]["label"] == "telegram"
 
 
-def test_skill_detail_lists_the_crons_that_use_it(client, home):
+def test_skill_detail_lists_the_crons_and_webhooks_that_use_it(client, home):
     write_skill(home / "skills", "research/arxiv")
-    write_json(home / "cron" / "jobs.json", {"jobs": [{"name": "b-job", "skills": ["arxiv"]}, {"name": "a-job", "skill": "arxiv"}, {"name": "x", "skills": ["other"]}]})
+    write_json(
+        home / "cron" / "jobs.json",
+        {"jobs": [
+            {"id": "jb", "name": "b-job", "skills": ["arxiv"], "deliver": ["telegram", "discord:9"], "last_status": "error"},
+            {"id": "ja", "name": "a-job", "skill": "research/arxiv", "enabled": False},
+            {"id": "jx", "name": "x", "skills": ["other"]},
+        ]},
+    )
+    write_json(
+        home / "webhook_subscriptions.json",
+        {
+            "z-hook": {"skills": ["arxiv", "other"], "deliver": "slack", "secret": "s3cr3t"},
+            "a-hook": {"skills": "arxiv"},
+            "unrelated": {"skills": ["other"]},
+        },
+    )
 
-    assert client.get("/skills/arxiv").json()["used_by_crons"] == ["a-job", "b-job"]
+    detail = client.get("/skills/arxiv").json()
+
+    assert "used_by_crons" not in detail
+    assert detail["used_by"] == [
+        {"kind": "cron", "id": "ja", "name": "a-job", "deliver": "local", "status": "paused", "health": "paused"},
+        {"kind": "cron", "id": "jb", "name": "b-job", "deliver": "telegram,discord:9", "status": "error", "health": "error"},
+        {"kind": "webhook", "name": "a-hook", "deliver": ""},
+        {"kind": "webhook", "name": "z-hook", "deliver": "slack"},
+    ]
 
 
 def test_unreadable_cron_file_is_reported_not_swallowed(client, home):
@@ -962,3 +988,556 @@ def test_a_whole_skill_save_is_refused_when_the_file_changed_since_it_was_read(c
 
     assert stale.status_code == 409
     assert "changed elsewhere" in md.read_text()
+
+
+def cron_job(client, home, **fields):
+    write_json(home / "cron" / "jobs.json", {"jobs": [{"id": "j1", "name": "job", "skills": ["s"], **fields}]})
+    return client.get("/crons").json()["jobs"][0]
+
+
+def test_a_healthy_run_is_ok(client, home):
+    job = cron_job(client, home, last_status="ok", last_error=None, failure_streak=0, next_run_at="2026-11-09T09:00:00+00:00")
+
+    assert (job["status"], job["health"], job["last_status"]) == ("ok", "ok", "ok")
+    assert (job["last_error"], job["failure_streak"], job["unattached"]) == (None, 0, False)
+    assert job["next_run_at"] == "2026-11-09T09:00:00+00:00"
+    assert job["issues"] == []
+
+
+def test_a_failed_run_is_an_error_with_its_message_and_streak(client, home):
+    job = cron_job(client, home, last_status="error", last_error="boom: API 500", failure_streak=3)
+
+    assert (job["status"], job["health"]) == ("error", "error")
+    assert (job["last_error"], job["failure_streak"]) == ("boom: API 500", 3)
+    assert job["issues"] == ["Last run error: boom: API 500", "Failed 3 runs in a row"]
+    assert cron_job(client, home, last_status="error", failure_streak=1)["issues"] == ["Last run error", "Failed 1 run in a row"]
+
+
+def test_a_job_blocked_on_config_is_blocked_not_ok(client, home):
+    job = cron_job(client, home, last_status="blocked_config", last_error="no API key for provider")
+
+    assert (job["status"], job["health"]) == ("blocked_config", "blocked")
+    assert job["issues"] == ["Last run blocked_config: no API key for provider"]
+    assert cron_job(client, home, last_status="blocked_config")["issues"] == ["Last run blocked_config"]
+
+
+def test_a_paused_job_says_since_when_and_why(client, home):
+    job = cron_job(client, home, enabled=False, state="paused", last_status="ok", paused_at="2026-11-08T09:00:00+00:00", paused_reason="operator hold")
+
+    assert (job["status"], job["health"]) == ("paused", "paused")
+    assert (job["paused_at"], job["paused_reason"]) == ("2026-11-08T09:00:00+00:00", "operator hold")
+    assert job["issues"] == ["Paused since 2026-11-08T09:00:00+00:00: operator hold"]
+    assert cron_job(client, home, enabled=False, paused_at="2026-11-08")["issues"] == ["Paused since 2026-11-08"]
+    assert cron_job(client, home, enabled=False, paused_reason="hold")["issues"] == ["Paused: hold"]
+    assert cron_job(client, home, enabled=False)["issues"] == ["Paused"]
+
+
+def test_a_finished_repeat_is_completed_and_not_a_problem(client, home):
+    job = cron_job(client, home, enabled=False, state="completed", last_status="ok", repeat={"times": 3, "completed": 3})
+
+    assert (job["status"], job["health"]) == ("completed", "other")
+    assert job["issues"] == []
+
+
+def test_a_job_that_never_ran_is_never(client, home):
+    for last_status in (None, ""):
+        job = cron_job(client, home, last_status=last_status)
+        assert (job["status"], job["health"], job["last_status"]) == ("never", "never", last_status)
+        assert job["issues"] == []
+
+
+def test_an_unknown_status_is_shown_verbatim_and_never_counts_as_ok(client, home):
+    job = cron_job(client, home, last_status="quantum_flux")
+
+    assert (job["status"], job["health"], job["last_status"]) == ("quantum_flux", "other", "quantum_flux")
+    assert job["issues"] == ["Last run quantum_flux"]
+    delivery = cron_job(client, home, last_status="delivery_failed", last_delivery_error="chat not found")
+    assert (delivery["status"], delivery["health"]) == ("delivery_failed", "other")
+    assert delivery["issues"] == ["Last run delivery_failed", "Delivery: chat not found"]
+    for status in ("interrupted", "cancelled"):
+        assert cron_job(client, home, last_status=status)["health"] == "other"
+
+
+def test_issues_come_in_a_fixed_order_and_flag_jobs_with_nothing_attached(client, home):
+    job = cron_job(client, home, skills=[], last_status="error", last_error="boom", failure_streak=2, last_delivery_error="403")
+
+    assert job["unattached"] is True
+    assert job["issues"] == ["Last run error: boom", "Failed 2 runs in a row", "Delivery: 403", "No skill or script attached"]
+    assert cron_job(client, home, skills=[], script="x.py")["unattached"] is False
+    assert cron_job(client, home, skills=[], no_agent=True)["unattached"] is False
+
+
+def test_a_job_shows_its_config_without_credentials_or_base_url(client, home):
+    job = cron_job(
+        client,
+        home,
+        model="anthropic/claude-sonnet-4-5-20250929",
+        provider="anthropic",
+        base_url="https://llm.internal/v1",
+        enabled_toolsets=["web", "terminal"],
+        profile="work",
+        workdir="/home/dev/projects/some-quite-long-nested-folder/app",
+        context_from=["j0"],
+        repeat={"times": 3, "completed": 1},
+        no_agent=True,
+        api_key="sk-live-should-never-appear",
+        prompt="p",
+    )
+
+    assert job["config"] == {
+        "model": "anthropic/claude-sonnet-4-5-20250929",
+        "provider": "anthropic",
+        "enabled_toolsets": ["web", "terminal"],
+        "profile": "work",
+        "workdir": "/home/dev/projects/some-quite-long-nested-folder/app",
+        "context_from": ["j0"],
+        "repeat": {"times": 3, "completed": 1},
+        "no_agent": True,
+    }
+    assert "llm.internal" not in json.dumps(job) and "should-never-appear" not in json.dumps(job)
+
+
+def test_empty_config_values_are_left_out(client, home):
+    job = cron_job(client, home, model=None, provider="", enabled_toolsets=[], context_from=[], workdir=None, no_agent=False)
+
+    assert job["config"] == {}
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("model", "sk-proj-abcdefghijklmnop"),
+        ("provider", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+        ("workdir", "https://deploy:hunter2@git.example.com/repo.git"),
+        ("workdir", "https://git.example.com/repo.git?access_token=abc123"),
+        ("model", "AKIAIOSFODNN7EXAMPLE"),
+        ("provider", "xoxb-1234-5678-abcdefghij"),
+        ("model", "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
+        ("model", "dGhpcyBpcyBhIHNlY3JldCBrZXkgdGhhdCBpcyBsb25nIGVub3VnaA=="),
+        ("enabled_toolsets", ["web", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"]),
+        ("repeat", {"times": 2, "note": "xoxp-0000-1111-aaaaaaaa"}),
+    ],
+)
+def test_a_config_value_that_looks_like_a_credential_is_dropped(client, home, key, value):
+    job = cron_job(client, home, no_agent=True, **{key: value})
+
+    assert job["config"] == {"no_agent": True}
+
+
+def test_a_credential_in_one_field_does_not_hide_the_others(client, home):
+    job = cron_job(client, home, model="sk-proj-abcdefghijklmnop", provider="openai", workdir="/srv/app")
+
+    assert job["config"] == {"provider": "openai", "workdir": "/srv/app"}
+
+
+def write_run(home: Path, job_id: str, stamp: str, text: str = "output") -> Path:
+    path = home / "cron" / "output" / job_id / f"{stamp}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_runs_are_listed_newest_first_with_a_limit_and_sizes(client, home):
+    write_run(home, "j1", "2026-11-07_09-00-00", "a")
+    write_run(home, "j1", "2026-11-08_10-00-00", "bbb")
+    write_run(home, "j1", "2026-11-08_08-30-00", "cc")
+    (home / "cron" / "output" / "j1" / "notes.md").write_text("not a run")
+    (home / "cron" / "output" / "j1" / "2026-11-09_00-00-00.txt").write_text("not a run")
+    (home / "cron" / "output" / "j1" / "2026-11-09_01-00-00.md").mkdir()
+    (home / "cron" / "output" / "j1" / "2026-11-09_02-00-00.md").symlink_to(home / "cron" / "output" / "j1" / "notes.md")
+
+    body = client.get("/crons/j1/runs").json()
+
+    assert body["job_id"] == "j1" and body["total"] == 3
+    assert body["runs"] == [
+        {"id": "2026-11-08_10-00-00", "at": "2026-11-08T10:00:00", "size": 3},
+        {"id": "2026-11-08_08-30-00", "at": "2026-11-08T08:30:00", "size": 2},
+        {"id": "2026-11-07_09-00-00", "at": "2026-11-07T09:00:00", "size": 1},
+    ]
+    limited = client.get("/crons/j1/runs", params={"limit": 2}).json()
+    assert [r["id"] for r in limited["runs"]] == ["2026-11-08_10-00-00", "2026-11-08_08-30-00"]
+    assert limited["total"] == 3
+    assert client.get("/crons/j1/runs", params={"limit": 0}).status_code == 422
+    assert client.get("/crons/j1/runs", params={"limit": 201}).status_code == 422
+
+
+def test_a_job_without_output_has_no_runs(client, home):
+    assert client.get("/crons/nothing-yet/runs").json() == {"job_id": "nothing-yet", "runs": [], "total": 0}
+    assert not (home / "cron").exists()
+
+
+def test_one_run_is_read_with_its_time_and_size(client, home):
+    write_run(home, "j1", "2026-11-08_10-00-00", "# Result\nall good\n")
+
+    body = client.get("/crons/j1/runs/2026-11-08_10-00-00").json()
+
+    assert body == {
+        "job_id": "j1", "id": "2026-11-08_10-00-00", "at": "2026-11-08T10:00:00",
+        "size": 18, "truncated": False, "content": "# Result\nall good\n",
+    }
+    assert client.get("/crons/j1/runs/2026-11-08_11-00-00").status_code == 404
+    assert client.get("/crons/other/runs/2026-11-08_10-00-00").status_code == 404
+
+
+def test_a_big_run_is_cut_at_the_script_limit_and_bad_bytes_are_replaced(client, home, api):
+    write_run(home, "j1", "2026-11-08_10-00-00", "x" * (api.MAX_SCRIPT_BYTES + 10))
+    (home / "cron" / "output" / "j1" / "2026-11-08_11-00-00.md").write_bytes(b"ok \xff\xfe end")
+
+    big = client.get("/crons/j1/runs/2026-11-08_10-00-00").json()
+    odd = client.get("/crons/j1/runs/2026-11-08_11-00-00")
+
+    assert big["truncated"] is True and len(big["content"]) == api.MAX_SCRIPT_BYTES
+    assert big["size"] == api.MAX_SCRIPT_BYTES + 10
+    assert odd.status_code == 200 and odd.json()["content"] == "ok �� end"
+
+
+@pytest.mark.parametrize("bad", ["%2E%2E", "a..b", ".hidden", "a%20b", "a%00b", "x" * 129])
+def test_a_malformed_job_id_is_a_400(client, home, bad):
+    assert client.get(f"/crons/{bad}/runs").status_code == 400
+    assert client.get(f"/crons/{bad}/runs/2026-11-08_10-00-00").status_code == 400
+
+
+@pytest.mark.parametrize("bad", ["%2E%2E", "latest", "2026-11-08", "2026-11-08_10-00-00.md", "2026-11-08_10-00-00%0A", "2026-11-08_10-00-0%EF%BC%90"])
+def test_a_malformed_run_id_is_a_400(client, home, bad):
+    write_run(home, "j1", "2026-11-08_10-00-00")
+
+    assert client.get(f"/crons/j1/runs/{bad}").status_code == 400
+
+
+@pytest.mark.parametrize("bad", ["a/b", "../../jobs", "a%2Fb", "..%2F..%2Fcron", ".."])
+def test_ids_with_slashes_never_reach_a_file_outside_the_output_folder(client, home, bad):
+    write_json(home / "cron" / "jobs.json", {"jobs": [{"id": "j1", "name": "job", "prompt": "TOP-SECRET-JOBS"}]})
+    write_run(home, "j1", "2026-11-08_10-00-00")
+
+    for url in (f"/crons/{bad}/runs", f"/crons/j1/runs/{bad}", f"/crons/{bad}/runs/2026-11-08_10-00-00"):
+        response = client.get(url)
+        assert response.status_code in (400, 404), url
+        assert "TOP-SECRET-JOBS" not in response.text
+
+
+def test_a_run_file_linked_to_somewhere_else_is_refused(client, home, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside") / "passwd.txt"
+    outside.write_text("root:secret")
+    folder = home / "cron" / "output" / "j1"
+    folder.mkdir(parents=True)
+    (folder / "2026-11-08_10-00-00.md").symlink_to(outside)
+
+    response = client.get("/crons/j1/runs/2026-11-08_10-00-00")
+
+    assert response.status_code == 403
+    assert "secret" not in response.text
+    assert client.get("/crons/j1/runs").json()["runs"] == []
+
+
+def test_runs_of_another_profile_are_readable_but_belong_to_that_profile(client, home):
+    work = home / "profiles" / "work"
+    write_run(work, "j1", "2026-11-06_07-00-00", "work output")
+
+    listed = client.get("/crons/j1/runs", params={"profile": "work"}).json()
+    read = client.get("/crons/j1/runs/2026-11-06_07-00-00", params={"profile": "work"})
+
+    assert [r["id"] for r in listed["runs"]] == ["2026-11-06_07-00-00"]
+    assert read.json()["content"] == "work output"
+    assert client.get("/crons/j1/runs").json()["runs"] == []
+    assert client.get("/crons/j1/runs/2026-11-06_07-00-00").status_code == 404
+    assert client.get("/crons/j1/runs", params={"profile": "ghost"}).status_code == 404
+
+
+def test_scripts_report_the_ref_their_history_is_kept_under(client, home):
+    scripts = home / "scripts"
+    (scripts / "sub").mkdir(parents=True)
+    (scripts / "sub" / "x.sh").write_text("echo x\n")
+
+    for spelling in ("sub/x.sh", "~/.hermes/scripts/sub/x.sh", str(scripts / "sub" / "x.sh")):
+        assert client.get("/scripts", params={"path": spelling}).json()["ref"] == "sub/x.sh"
+
+
+class HistoryCase(NamedTuple):
+    kind: str
+    ref: str
+    old: str
+    new: str
+    save: Callable[[str, str], object]
+    current: Callable[[], str]
+
+
+def skill_case(client, home):
+    md = write_skill(home / "skills", "target")
+    new = VALID_SKILL.format(name="target", description="changed")
+    return HistoryCase(
+        "skill", "target", md.read_text(), new,
+        lambda expected, content: client.put("/skills/target", json={"expected": expected, "content": content}),
+        md.read_text,
+    )
+
+
+def script_case(client, home):
+    script = home / "scripts" / "sub" / "job.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("echo old\n")
+    return HistoryCase(
+        "script", "sub/job.sh", "echo old\n", "echo new\n",
+        lambda expected, content: client.put("/scripts", json={"path": "sub/job.sh", "expected": expected, "content": content}),
+        script.read_text,
+    )
+
+
+def cron_prompt_case(client, home):
+    cron_jobs = pytest.importorskip("cron.jobs")
+    job_id = cron_jobs.create_job(prompt="Old prompt", schedule="every 1h", name="hourly")["id"]
+    return HistoryCase(
+        "cron-prompt", job_id, "Old prompt", "New prompt",
+        lambda expected, content: client.put(f"/crons/{job_id}/prompt", json={"expected": expected, "content": content}),
+        lambda: cron_jobs.get_job(job_id)["prompt"],
+    )
+
+
+def cron_deliver_case(client, home):
+    cron_jobs = pytest.importorskip("cron.jobs")
+    job_id = cron_jobs.create_job(prompt="p", schedule="every 1h", name="hourly", deliver="local")["id"]
+    return HistoryCase(
+        "cron-deliver", job_id, "local", "telegram",
+        lambda expected, content: client.put(f"/crons/{job_id}/deliver", json={"expected": expected, "content": content}),
+        lambda: cron_jobs.get_job(job_id)["deliver"],
+    )
+
+
+def webhook_prompt_case(client, home):
+    pytest.importorskip("hermes_cli.webhook")
+    store = home / "webhook_subscriptions.json"
+    write_json(store, {"gh": {"prompt": "Old", "secret": "s3cr3t-hmac-value-1234", "events": ["push"]}})
+    return HistoryCase(
+        "webhook-prompt", "gh", "Old", "New",
+        lambda expected, content: client.put("/webhooks/gh/prompt", json={"expected": expected, "content": content}),
+        lambda: json.loads(store.read_text())["gh"]["prompt"],
+    )
+
+
+HISTORY_CASES = {
+    "skill": skill_case,
+    "script": script_case,
+    "cron-prompt": cron_prompt_case,
+    "cron-deliver": cron_deliver_case,
+    "webhook-prompt": webhook_prompt_case,
+}
+
+
+@pytest.fixture(params=list(HISTORY_CASES))
+def case(request, client, home):
+    return HISTORY_CASES[request.param](client, home)
+
+
+def history_root(home: Path) -> Path:
+    return home / "plugin-data" / "ariadne-thread" / "history"
+
+
+def versions(client, case, **params) -> list[dict]:
+    response = client.get("/history", params={"kind": case.kind, "ref": case.ref, **params})
+    assert response.status_code == 200, response.text
+    return response.json()["versions"]
+
+
+def version(client, case, version_id: str, **params):
+    return client.get("/history/version", params={"kind": case.kind, "ref": case.ref, "id": version_id, **params})
+
+
+def revert(client, case, version_id: str, expected: str, **params):
+    body = {"kind": case.kind, "ref": case.ref, "id": version_id, "expected": expected}
+    return client.post("/history/revert", params=params, json=body)
+
+
+def test_every_save_keeps_the_text_it_replaces(client, home, case):
+    saved = case.save(case.old, case.new)
+
+    assert saved.status_code == 200, saved.text
+    assert case.current() == case.new
+    (listed,) = versions(client, case)
+    assert listed["size"] == len(case.old.encode()) and listed["saved_at"].endswith("+00:00")
+    body = version(client, case, listed["id"]).json()
+    assert (body["kind"], body["ref"], body["id"], body["saved_at"]) == (case.kind, case.ref, listed["id"], listed["saved_at"])
+    assert (body["content"], body["current"]) == (case.old, case.new)
+    assert body["diff"].startswith(f"--- current\n+++ version {listed['saved_at']}\n")
+
+
+def test_history_files_live_under_plugin_data_and_stay_private(client, home, case):
+    case.save(case.old, case.new)
+
+    (path,) = history_root(home).rglob("*.json")
+
+    assert path.relative_to(history_root(home)).parts[0] == case.kind
+    entry = json.loads(path.read_text())
+    assert set(entry) == {"kind", "ref", "id", "saved_at", "content"}
+    assert (entry["kind"], entry["ref"], entry["content"], path.stem) == (case.kind, case.ref, case.old, entry["id"])
+    assert len(entry["id"]) == 20 and entry["id"].isdigit()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    for folder in (home / "plugin-data", history_root(home), path.parent.parent, path.parent):
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    assert [p.name for p in path.parent.iterdir()] == [path.name]
+
+
+def test_a_save_that_changes_nothing_records_nothing(client, home, case):
+    saved = case.save(case.old, case.old)
+
+    assert saved.status_code == 200, saved.text
+    assert versions(client, case) == []
+    assert not (home / "plugin-data").exists()
+
+
+def test_a_refused_save_records_nothing(client, home, case):
+    stale = case.save("not what is on disk", case.new)
+
+    assert stale.status_code == 409
+    assert case.current() == case.old
+    assert versions(client, case) == []
+
+
+def test_a_rejected_skill_edit_records_nothing(client, home):
+    case = skill_case(client, home)
+
+    response = case.save(case.old, "no frontmatter")
+
+    assert response.status_code == 422
+    assert versions(client, case) == []
+
+
+def test_a_save_fails_and_writes_nothing_when_its_history_cannot_be_written(client, home, case):
+    (home / "plugin-data").write_text("a file where the history folder should go")
+
+    response = case.save(case.old, case.new)
+
+    assert response.status_code == 500
+    assert "nothing was changed" in response.json()["detail"]
+    assert case.current() == case.old
+
+
+def test_only_the_newest_ten_versions_are_kept(client, home):
+    case = skill_case(client, home)
+    texts = [case.old] + [VALID_SKILL.format(name="target", description=f"edit {i}") for i in range(1, 13)]
+    for before, after in zip(texts, texts[1:]):
+        assert case.save(before, after).status_code == 200
+
+    listed = versions(client, case)
+    kept = [version(client, case, v["id"]).json()["content"] for v in listed]
+
+    assert len(listed) == 10 == len(list(history_root(home).rglob("*.json")))
+    assert kept == texts[11:1:-1]
+    assert [v["id"] for v in listed] == sorted((v["id"] for v in listed), reverse=True)
+
+
+def test_a_step_edit_records_the_whole_skill_file(client, home):
+    write_skill(home / "skills", "steps", body=STEP_SKILL)
+    step = step_of(client, "steps", 0)
+
+    edit = client.put("/skills/steps/span", json={"start": step["span"][0], "end": step["span"][1], "expected": step["body"], "content": "Changed."})
+
+    assert edit.status_code == 200, edit.text
+    (listed,) = client.get("/history", params={"kind": "skill", "ref": "steps"}).json()["versions"]
+    saved = client.get("/history/version", params={"kind": "skill", "ref": "steps", "id": listed["id"]}).json()
+    assert saved["content"] == STEP_SKILL
+    assert "Changed." in saved["current"]
+
+
+def test_a_webhook_secret_never_reaches_the_history(client, home):
+    case = webhook_prompt_case(client, home)
+    case.save("Old", "Newer")
+    case.save("Newer", "Newest")
+    revert(client, case, versions(client, case)[-1]["id"], "Newest")
+
+    stored = [p.read_text() for p in (home / "plugin-data").rglob("*") if p.is_file()]
+
+    assert len(stored) == 3
+    assert not any("s3cr3t-hmac-value-1234" in text for text in stored)
+    assert "s3cr3t-hmac-value-1234" not in client.get("/history", params={"kind": case.kind, "ref": case.ref}).text
+
+
+def test_a_version_shows_the_current_text_as_a_diff_and_survives_a_deleted_target(client, home):
+    case = script_case(client, home)
+    case.save("echo old\n", "echo new\n")
+    (listed,) = versions(client, case)
+
+    body = version(client, case, listed["id"]).json()
+
+    assert body["diff"].splitlines() == [
+        "--- current", f"+++ version {listed['saved_at']}", "@@ -1 +1 @@", "-echo new", "+echo old",
+    ]
+    (home / "scripts" / "sub" / "job.sh").unlink()
+    gone = version(client, case, listed["id"]).json()
+    assert gone["current"] is None and gone["content"] == "echo old\n"
+    assert gone["diff"].splitlines()[2:] == ["@@ -0,0 +1 @@", "+echo old"]
+
+
+def test_reverting_writes_the_old_text_back_and_keeps_the_text_it_replaced(client, home, case):
+    case.save(case.old, case.new)
+    (listed,) = versions(client, case)
+
+    reverted = revert(client, case, listed["id"], expected=case.new)
+
+    assert reverted.status_code == 200, reverted.text
+    assert reverted.json()["reverted"] == listed["id"]
+    assert case.current() == case.old
+    newest, oldest = versions(client, case)
+    assert oldest["id"] == listed["id"]
+    assert version(client, case, newest["id"]).json()["content"] == case.new
+    undone = revert(client, case, newest["id"], expected=case.old)
+    assert undone.status_code == 200 and case.current() == case.new
+
+
+def test_reverting_from_a_stale_preview_changes_nothing(client, home, case):
+    case.save(case.old, case.new)
+    (listed,) = versions(client, case)
+
+    stale = revert(client, case, listed["id"], expected="what the preview showed before someone else edited")
+
+    assert stale.status_code == 409
+    assert case.current() == case.new
+    assert versions(client, case) == [listed]
+
+
+def test_reverting_is_refused_under_another_profile(client, home, case):
+    case.save(case.old, case.new)
+    (listed,) = versions(client, case)
+    (home / "profiles" / "work").mkdir(parents=True)
+
+    response = revert(client, case, listed["id"], expected=case.new, profile="work")
+
+    assert response.status_code == 403
+    assert case.current() == case.new
+    assert versions(client, case) == [listed]
+
+
+def test_other_profiles_history_is_read_from_their_own_home(client, home):
+    case = skill_case(client, home)
+    case.save(case.old, case.new)
+    work = home / "profiles" / "work"
+    folder = work / "plugin-data" / "ariadne-thread" / "history" / "skill" / hashlib.sha256(b"target").hexdigest()[:24]
+    folder.mkdir(parents=True)
+    entry = {"kind": "skill", "ref": "target", "id": "0" * 19 + "7", "saved_at": "2026-11-01T00:00:00+00:00", "content": "work text"}
+    (folder / f"{entry['id']}.json").write_text(json.dumps(entry))
+
+    assert [v["id"] for v in versions(client, case, profile="work")] == [entry["id"]]
+    assert version(client, case, entry["id"], profile="work").json()["content"] == "work text"
+    assert version(client, case, entry["id"]).status_code == 404
+
+
+def test_reading_history_creates_nothing(client, home):
+    (home / "profiles" / "work").mkdir(parents=True)
+    case = skill_case(client, home)
+
+    assert versions(client, case) == []
+    assert versions(client, case, profile="work") == []
+    assert not (home / "plugin-data").exists() and not (home / "profiles" / "work" / "plugin-data").exists()
+
+
+def test_history_rejects_unknown_kinds_and_malformed_ids(client, home):
+    ref = {"ref": "target"}
+
+    assert client.get("/history", params={"kind": "nope", **ref}).status_code == 400
+    assert client.get("/history/version", params={"kind": "nope", "id": "0" * 20, **ref}).status_code == 400
+    revert_body = {"kind": "nope", "ref": "target", "id": "0" * 20, "expected": ""}
+    assert client.post("/history/revert", json=revert_body).status_code == 400
+    for bad in ("1", "0" * 19, "0" * 21, "../" + "0" * 17, "a" * 20, "0" * 19 + "\n", "0" * 19 + "٠"):
+        params = {"kind": "skill", "id": bad, **ref}
+        assert client.get("/history/version", params=params).status_code == 400, repr(bad)
+        assert client.post("/history/revert", json={**revert_body, "kind": "skill", "id": bad}).status_code == 400, repr(bad)
+    assert client.get("/history/version", params={"kind": "skill", "id": "0" * 20, **ref}).status_code == 404
+    assert client.post("/history/revert", json={**revert_body, "kind": "skill"}).status_code == 404
