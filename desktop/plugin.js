@@ -21,6 +21,7 @@ const POLL_MS = 12000
 const DRAFT_ATTEMPTS = 6
 const DRAFT_RETRY_MS = 250
 const AGENT_BOX_MAX_PX = 240
+const IMPACT_NAMES = 4
 
 const TXT1 = 'var(--ui-text-primary, #e5e7eb)'
 const TXT2 = 'var(--ui-text-secondary, #e5e7eb)'
@@ -99,12 +100,27 @@ const canEdit = (profile) => !profile || profile === 'default'
 
 // Every save carries the text the edit started from, so the backend answers 409 instead of
 // overwriting a change made meanwhile by Hermes, an agent, or another window.
-async function save(ctx, path, body, what) {
-  const res = await ctx.rest(path, { method: 'PUT', body })
+async function write(ctx, method, path, body, message) {
+  const res = await ctx.rest(path, { method, body })
   haptic('tap')
   queryClient.invalidateQueries({ queryKey: [ID] })
-  host.notify({ kind: 'success', message: 'Saved ' + what })
+  host.notify({ kind: 'success', message })
   return res
+}
+
+const save = (ctx, path, body, what) => write(ctx, 'PUT', path, body, 'Saved ' + what)
+
+const historyOf = (ctx, kind, ref, what) => ({ ctx, kind, ref, what })
+
+function impactNote(usedBy) {
+  if (!Array.isArray(usedBy)) return null
+  const names = usedBy.map((u) => u.name)
+  const shown = names.slice(0, IMPACT_NAMES).join(', ') + (names.length > IMPACT_NAMES ? '…' : '')
+  return h(
+    'span',
+    { title: names.join(', '), style: { color: names.length ? AMBER : TXT4, fontSize: '0.6875rem', overflowWrap: 'anywhere' } },
+    names.length ? 'Saving affects ' + names.length + ': ' + shown : 'Not used by any cron or webhook'
+  )
 }
 
 const scriptEdit = (ctx, script, owner) => ({
@@ -115,12 +131,16 @@ const scriptEdit = (ctx, script, owner) => ({
 const cronStepEdit = (ctx, job) => (step) => {
   if (step.script) return scriptEdit(ctx, step.script, 'cron job "' + job.name + '"')
   if (step.type === 'deliver' && job.id) {
-    return { save: (content, expected) => save(ctx, '/crons/' + encodeURIComponent(job.id) + '/deliver', { expected, content }, 'the delivery of ' + job.name) }
+    return {
+      save: (content, expected) => save(ctx, '/crons/' + encodeURIComponent(job.id) + '/deliver', { expected, content }, 'the delivery of ' + job.name),
+      history: historyOf(ctx, 'cron-deliver', job.id, 'the delivery of ' + job.name),
+    }
   }
   if (step.type !== 'prompt' || !job.id) return null
   return {
     save: (content, expected) => save(ctx, '/crons/' + encodeURIComponent(job.id) + '/prompt', { expected, content }, 'the prompt of ' + job.name),
     ask: (request) => cronPromptPrompt(job, step.body, request),
+    history: historyOf(ctx, 'cron-prompt', job.id, 'the prompt of ' + job.name),
   }
 }
 
@@ -130,6 +150,7 @@ const webhookStepEdit = (ctx, route) => (step) => {
   return {
     save: (content, expected) => save(ctx, '/webhooks/' + encodeURIComponent(route.name) + '/prompt', { expected, content }, 'the prompt of ' + route.name),
     ask: (request) => webhookPromptPrompt(route, step.body, request),
+    history: historyOf(ctx, 'webhook-prompt', route.name, 'the prompt of ' + route.name),
   }
 }
 
@@ -139,18 +160,30 @@ const skillStepEdit = (ctx, detail) => (step) =>
         save: (content, expected) =>
           save(ctx, '/skills/' + encodeURIComponent(detail.name) + '/span', { start: step.span[0], end: step.span[1], expected, content }, 'a step of ' + detail.name),
         ask: (request) => skillStepPrompt(detail, step, request),
+        history: historyOf(ctx, 'skill', detail.name, detail.name),
+        impact: impactNote(detail.used_by),
       }
     : null
 
 const pick = (items, selected) =>
   items.find((i) => i.name === selected) || items[0] || null
 
-function StatusDot({ status }) {
-  const color = { ok: GREEN, error: RED, paused: TXT3 }[status] || TXT3
+// A cron's health is the backend's verdict on its last run; unknown last statuses stay amber, never green.
+// Without a health field (an older backend) the status itself is the best guess.
+const healthOf = (item) => item.health || item.status
+const HEALTH_COLOR = { ok: GREEN, error: RED, blocked: AMBER, other: AMBER, paused: TXT3, never: TXT3 }
+const statusColor = (item) => (item.status === 'completed' ? TXT3 : HEALTH_COLOR[healthOf(item)] || TXT3)
+
+function StatusDot({ item }) {
   return h('span', {
-    title: status === 'ok' || status === 'error' ? status : 'paused',
-    style: { display: 'inline-block', width: '8px', height: '8px', borderRadius: '9999px', background: color, flexShrink: 0 },
+    title: item.status,
+    style: { display: 'inline-block', width: '8px', height: '8px', borderRadius: '9999px', background: statusColor(item), flexShrink: 0 },
   })
+}
+
+function StatusText({ item }) {
+  if (!item.status || item.status === 'ok') return null
+  return h('span', { style: { color: statusColor(item), fontSize: '0.625rem', whiteSpace: 'nowrap' } }, item.status)
 }
 
 function Badge({ children, tone }) {
@@ -204,7 +237,7 @@ function FlowArrow() {
 // Clicking a step expands it in place to show its content; a widened card keeps scripts readable.
 // Skill steps never expand: their "Go to skill" button opens the whole skill instead.
 // A lone step has nothing to scan past, so it opens expanded and does not collapse.
-// edit(step) returns { save(content, expected), ask(request) } for a step the user may change, else null.
+// edit(step) returns { save(content, expected), ask(request), history, impact } for a step the user may change, else null.
 function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
   const [open, setOpen] = useState(() => new Set())
   if (!sequence || !sequence.length) return h(Note, { text: 'No steps' })
@@ -288,8 +321,8 @@ function Pipeline({ sequence, ctx, profile, onOpenSkill, edit }) {
                 step.script
                   ? h(ScriptBody, { ctx, profile, script: step.script, onSave: editor && editor.save, ask, maxHeight: '60vh' })
                   : action === 'deliver'
-                  ? h(DeliverBody, { ctx, profile, step, onSave: editor && editor.save })
-                  : h(TextEditor, { value: step.body, onSave: editor && editor.save, ask, maxHeight: '60vh' })
+                  ? h(DeliverBody, { ctx, profile, step, onSave: editor && editor.save, history: editor && editor.history })
+                  : h(TextEditor, { value: step.body, onSave: editor && editor.save, ask, maxHeight: '60vh', history: editor && editor.history, impact: editor && editor.impact })
               )
             : null
         )
@@ -317,7 +350,7 @@ function ListDetail({ top, list, children }) {
   )
 }
 
-function ListRow({ active, onClick, children }) {
+function ListRow({ active, onClick, compact, children }) {
   return h(
     'button',
     {
@@ -326,7 +359,7 @@ function ListRow({ active, onClick, children }) {
         display: 'block',
         width: '100%',
         textAlign: 'left',
-        padding: '8px',
+        padding: compact ? '3px 8px' : '8px',
         borderRadius: RADIUS,
         // Same active look as the host sidebar's nav items.
         border: '1px solid ' + (active ? 'var(--ui-stroke-tertiary, ' + STROKE + ')' : 'transparent'),
@@ -339,8 +372,226 @@ function ListRow({ active, onClick, children }) {
   )
 }
 
+const healthIs = (health) => (j) => healthOf(j) === health
+const HEALTH_CHIPS = [
+  { id: 'ok', label: 'ok', color: GREEN, test: healthIs('ok') },
+  { id: 'error', label: 'error', color: RED, test: healthIs('error') },
+  { id: 'blocked', label: 'blocked', color: AMBER, test: healthIs('blocked') },
+  { id: 'paused', label: 'paused', color: TXT3, test: healthIs('paused') },
+  { id: 'delivery', label: 'delivery errors', color: AMBER, test: (j) => !!j.last_delivery_error },
+  { id: 'unattached', label: 'no skill or script', color: AMBER, test: (j) => !!j.unattached },
+  { id: 'other', label: 'other', color: AMBER, test: healthIs('other'), hideEmpty: true },
+  { id: 'never', label: 'never run', color: TXT3, test: healthIs('never'), hideEmpty: true },
+]
+
+function HealthBar({ jobs, active, onPick }) {
+  const chip = (id, label, color, count) => {
+    const on = id === 'all' ? active == null : active === id
+    const idle = !on && count === 0
+    return h(
+      'button',
+      {
+        key: id,
+        onClick: () => !idle && onPick(on || id === 'all' ? null : id),
+        'aria-pressed': on,
+        title: id === 'all' ? 'Show every cron' : on ? 'Clear the filter' : idle ? 'No crons' : 'Show only these',
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '4px',
+          padding: '2px 8px',
+          borderRadius: '9999px',
+          border: '1px solid ' + (on ? ACCENT : STROKE),
+          background: on ? mix(ACCENT, 14) : 'transparent',
+          color: on ? TXT1 : TXT2,
+          fontSize: '0.6875rem',
+          whiteSpace: 'nowrap',
+          cursor: idle ? 'default' : 'pointer',
+          opacity: idle ? 0.5 : 1,
+        },
+      },
+      color ? h('span', { style: { width: '6px', height: '6px', borderRadius: '9999px', background: color, flexShrink: 0 } }) : null,
+      h('span', { style: { fontWeight: 600 } }, count),
+      label
+    )
+  }
+  return h(
+    'div',
+    { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', padding: '8px', borderBottom: '1px solid ' + STROKE } },
+    chip('all', 'all', null, jobs.length),
+    HEALTH_CHIPS.map((c) => ({ c, count: jobs.filter(c.test).length }))
+      .filter(({ c, count }) => !c.hideEmpty || count > 0 || active === c.id)
+      .map(({ c, count }) => chip(c.id, c.label, c.color, count))
+  )
+}
+
+const MINUTE_MS = 60000
+
+function relativeTime(ms) {
+  const diff = ms - Date.now()
+  const min = Math.round(Math.abs(diff) / MINUTE_MS)
+  if (min < 1) return 'now'
+  const span = min < 60 ? min + ' min' : min < 48 * 60 ? Math.round(min / 60) + ' h' : Math.round(min / 1440) + ' d'
+  return diff > 0 ? 'in ' + span : span + ' ago'
+}
+
+const localTime = (iso) => {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString()
+}
+
+const fmtBytes = (n) => (n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB')
+
+const configValue = (v) => (Array.isArray(v) ? v.map(configValue).join(', ') : v && typeof v === 'object' ? JSON.stringify(v) : String(v))
+
+function nextRunText(job) {
+  if (!job.next_run_at) return 'not scheduled'
+  const at = new Date(job.next_run_at)
+  if (Number.isNaN(at.getTime())) return String(job.next_run_at)
+  return relativeTime(at.getTime()) + ' · ' + at.toLocaleString()
+}
+
+function ConfigPanel({ job }) {
+  const rows = [['next run', nextRunText(job)], ...Object.entries(job.config || {}).map(([k, v]) => [k, configValue(v)])]
+  return h(
+    'div',
+    { style: { marginTop: '12px' } },
+    h(SectionLabel, { text: 'Config' }),
+    h(
+      'div',
+      { style: { display: 'grid', gridTemplateColumns: 'max-content minmax(0, 1fr)', columnGap: '12px', rowGap: '2px', marginTop: '4px' } },
+      rows.map(([k, v]) => [
+        h('span', { key: 'k:' + k, style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO } }, k),
+        h('span', { key: 'v:' + k, style: { color: TXT2, fontSize: '0.75rem', overflowWrap: 'anywhere' } }, v),
+      ])
+    )
+  )
+}
+
+const skillName = (ref) => ref.split('/').pop()
+
+function ThreadLine({ job, onOpenSkill }) {
+  const skills = job.skills || []
+  if (!skills.length) return null
+  return h(
+    'div',
+    { style: { marginTop: '8px', display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+    h(SectionLabel, { text: 'Thread' }),
+    skills.map((s) =>
+      h(
+        'button',
+        { key: s, onClick: () => onOpenSkill(skillName(s)), title: 'Go to skill', style: { background: 'transparent', border: 'none', padding: 0, cursor: 'pointer' } },
+        h(Badge, { tone: 'accent' }, s)
+      )
+    ),
+    h('span', { style: { color: TXT4, fontSize: '0.75rem' } }, '→'),
+    h(Badge, {}, job.deliver || 'local')
+  )
+}
+
+function RunsPanel({ ctx, profile, job }) {
+  const [open, setOpen] = useState(false)
+  const [picked, setPicked] = useState(null)
+  const path = '/crons/' + encodeURIComponent(job.id) + '/runs'
+  const list = useQuery({
+    queryKey: [ID, 'runs', profile, job.id],
+    queryFn: () => ctx.rest(withProfile(path, profile)),
+    refetchInterval: POLL_MS,
+  })
+  const run = useQuery({
+    queryKey: [ID, 'run', profile, job.id, picked],
+    queryFn: () => ctx.rest(withProfile(path + '/' + encodeURIComponent(picked), profile)),
+    enabled: open && !!picked,
+  })
+  const runs = (list.data && list.data.runs) || []
+  const total = list.data ? list.data.total : null
+
+  const outcome = () => {
+    if (!picked) return null
+    const failed = gate(run, 'run output')
+    if (failed) return failed
+    const r = run.data
+    return h(
+      'div',
+      { style: { marginTop: '8px' } },
+      h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '4px' } }, r.at.replace('T', ' ') + ' · ' + fmtBytes(r.size)),
+      r.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '4px' } }, 'Truncated: showing the first part of a ' + fmtBytes(r.size) + ' output.') : null,
+      h('pre', { style: { ...codeBlock, maxHeight: '50vh', overflow: 'auto' } }, r.content || '(empty output)')
+    )
+  }
+
+  return h(
+    'div',
+    { style: { marginTop: '12px' } },
+    h(
+      'button',
+      { onClick: () => setOpen(!open), style: { display: 'flex', alignItems: 'center', gap: '6px', padding: 0, border: 'none', background: 'transparent', cursor: 'pointer' } },
+      h(SectionLabel, { text: 'Runs' }),
+      list.data ? h('span', { style: { color: TXT3, fontSize: '0.6875rem' } }, total + (total === 1 ? ' run' : ' runs')) : null,
+      h('span', { style: { color: TXT4, fontSize: '0.75rem' } }, open ? '▾' : '▸')
+    ),
+    open
+      ? h(
+          'div',
+          { style: { marginTop: '4px' } },
+          gate(list, 'runs') ||
+            (runs.length
+              ? h(
+                  Fragment,
+                  {},
+                  h(
+                    'div',
+                    { style: { maxHeight: '9rem', overflowY: 'auto' } },
+                    runs.map((r) =>
+                      h(
+                        ListRow,
+                        { key: r.id, compact: true, active: r.id === picked, onClick: () => setPicked(r.id === picked ? null : r.id) },
+                        h(
+                          'div',
+                          { style: { display: 'flex', justifyContent: 'space-between', gap: '8px', fontSize: '0.75rem' } },
+                          h('span', { style: { fontFamily: MONO } }, r.at.replace('T', ' ')),
+                          h('span', { style: { color: TXT4 } }, fmtBytes(r.size))
+                        )
+                      )
+                    )
+                  ),
+                  total > runs.length ? h('div', { style: { color: TXT4, fontSize: '0.6875rem', marginTop: '4px' } }, 'Latest ' + runs.length + ' of ' + total) : null,
+                  outcome()
+                )
+              : h('div', { style: { color: TXT3, fontSize: '0.75rem' } }, 'No runs recorded'))
+        )
+      : null
+  )
+}
+
+function CronDetail({ job, ctx, profile, onOpenSkill }) {
+  const from = { to: 'crons', item: job.name, kind: 'cron' }
+  return h(
+    Fragment,
+    {},
+    h(
+      'div',
+      { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+      h('div', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, job.name),
+      h(StatusDot, { item: job }),
+      h(StatusText, { item: job }),
+      job.category ? h(Badge, {}, job.category) : null,
+      job.deliver && job.deliver !== 'local' ? h(Badge, { tone: 'accent' }, '→ ' + job.deliver) : null
+    ),
+    h('div', { style: { fontSize: '0.75rem', color: TXT3, marginTop: '4px' } }, job.schedule_human || job.schedule),
+    job.issues && job.issues.length
+      ? h('div', { style: { marginTop: '8px' } }, job.issues.map((iss, i) => h('div', { key: i, style: { color: AMBER, fontSize: '0.75rem', overflowWrap: 'anywhere' } }, '⚠ ' + iss)))
+      : null,
+    h(ThreadLine, { job, onOpenSkill: (name) => onOpenSkill(name, from) }),
+    h(ConfigPanel, { job }),
+    job.id ? h(RunsPanel, { ctx, profile, job }) : null,
+    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { key: job.name, sequence: job.sequence, ctx, profile, edit: canEdit(profile) ? cronStepEdit(ctx, job) : null, onOpenSkill: (name) => onOpenSkill(name, from) }))
+  )
+}
+
 function CronsTab({ ctx, profile, nav, onOpenSkill }) {
   const [selected, setSelected] = useState(null)
+  const [filter, setFilter] = useState(null)
   const q = useQuery({
     queryKey: [ID, 'crons', profile],
     queryFn: () => ctx.rest(withProfile('/crons', profile)),
@@ -355,38 +606,32 @@ function CronsTab({ ctx, profile, nav, onOpenSkill }) {
   if (failed) return h(ListDetail, { list: failed })
   const jobs = (q.data && q.data.jobs) || []
   if (!jobs.length) return h(ListDetail, { list: h(Note, { text: 'No cron jobs' }) })
-  const job = pick(jobs, selected)
+  const chip = HEALTH_CHIPS.find((c) => c.id === filter)
+  const shown = chip ? jobs.filter(chip.test) : jobs
+  const job = pick(shown, selected) || pick(jobs, selected)
 
   return h(
     ListDetail,
     {
-      list: jobs.map((j) =>
-        h(
-          ListRow,
-          { key: j.name, active: j.name === job.name, onClick: () => setSelected(j.name) },
-          h(
-            'div',
-            { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
-            h(StatusDot, { status: j.status }),
-            h('span', { style: { fontSize: '0.8125rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, j.name)
-          ),
-          h('div', { style: { fontSize: '0.6875rem', color: TXT3, paddingLeft: '14px' } }, j.schedule_human || j.schedule)
-        )
-      ),
+      top: h(HealthBar, { jobs, active: filter, onPick: setFilter }),
+      list: shown.length
+        ? shown.map((j) =>
+            h(
+              ListRow,
+              { key: j.name, active: j.name === job.name, onClick: () => setSelected(j.name) },
+              h(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+                h(StatusDot, { item: j }),
+                h('span', { style: { flex: '1', minWidth: 0, fontSize: '0.8125rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, j.name),
+                h(StatusText, { item: j })
+              ),
+              h('div', { style: { fontSize: '0.6875rem', color: TXT3, paddingLeft: '14px' } }, j.schedule_human || j.schedule)
+            )
+          )
+        : h(Note, { text: 'No cron matches this filter' }),
     },
-    h(
-      'div',
-      { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
-      h('div', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, job.name),
-      h(StatusDot, { status: job.status }),
-      job.category ? h(Badge, {}, job.category) : null,
-      job.deliver && job.deliver !== 'local' ? h(Badge, { tone: 'accent' }, '→ ' + job.deliver) : null
-    ),
-    h('div', { style: { fontSize: '0.75rem', color: TXT3, marginTop: '4px' } }, job.schedule_human || job.schedule),
-    job.issues && job.issues.length
-      ? h('div', { style: { marginTop: '8px' } }, job.issues.map((iss, i) => h('div', { key: i, style: { color: AMBER, fontSize: '0.75rem' } }, '⚠ ' + iss)))
-      : null,
-    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { key: job.name, sequence: job.sequence, ctx, profile, edit: canEdit(profile) ? cronStepEdit(ctx, job) : null, onOpenSkill: (name) => onOpenSkill(name, { to: 'crons', item: job.name, kind: 'cron' }) }))
+    h(CronDetail, { key: job.name, job, ctx, profile, onOpenSkill })
   )
 }
 
@@ -644,6 +889,99 @@ function CodeArea({ value, lang, maxHeight, onChange, onKeyDown }) {
   )
 }
 
+function HistoryButton({ open, onClick }) {
+  return h('button', { onClick, style: open ? { ...smallButton, border: '1px solid ' + ACCENT, color: TXT1 } : smallButton }, '⟲ History')
+}
+
+function DiffView({ diff }) {
+  const tone = (line) =>
+    line.startsWith('+++') || line.startsWith('---') ? { color: TXT4 } : line.startsWith('@@') ? { color: BLUE } : line.startsWith('+') ? { color: GREEN, background: mix(GREEN, 12) } : line.startsWith('-') ? { color: RED, background: mix(RED, 12) } : {}
+  return h(
+    'pre',
+    { style: { ...codeBlock, maxHeight: '40vh', overflow: 'auto', padding: '8px' } },
+    diff.split('\n').map((line, i) => h('span', { key: i, style: { display: 'block', ...tone(line) } }, line || ' '))
+  )
+}
+
+// Revert sends the previewed text as `expected`, so the backend answers 409 if it moved on since.
+function HistoryPanel({ history, onDone }) {
+  const { ctx, kind, ref, what } = history
+  const [picked, setPicked] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState(null)
+  const scope = '?kind=' + encodeURIComponent(kind) + '&ref=' + encodeURIComponent(ref)
+  const list = useQuery({ queryKey: [ID, 'history', kind, ref], queryFn: () => ctx.rest('/history' + scope) })
+  const one = useQuery({
+    queryKey: [ID, 'history', kind, ref, picked],
+    queryFn: () => ctx.rest('/history/version' + scope + '&id=' + encodeURIComponent(picked)),
+    enabled: !!picked,
+  })
+
+  const revert = async () => {
+    setBusy(true)
+    setErr(null)
+    try {
+      await write(ctx, 'POST', '/history/revert', { kind, ref, id: picked, expected: one.data.current }, 'Reverted ' + what)
+      onDone()
+    } catch (e) {
+      setErr(errorText(e))
+      queryClient.invalidateQueries({ queryKey: [ID, 'history'] })
+    }
+    setBusy(false)
+  }
+
+  const versions = (list.data && list.data.versions) || []
+  const v = one.data
+  const preview = () => {
+    if (!picked) return null
+    const failed = gate(one, 'version')
+    if (failed) return failed
+    return h(
+      'div',
+      { style: { marginTop: '8px' } },
+      v.current === null ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '4px' } }, 'The current text no longer exists.') : null,
+      v.diff ? h(DiffView, { diff: v.diff }) : h('div', { style: { color: TXT3, fontSize: '0.75rem' } }, 'Identical to the current text.'),
+      err ? h('div', { style: { marginTop: '6px', color: RED, fontSize: '0.75rem' } }, err) : null,
+      h(
+        'div',
+        { style: { marginTop: '6px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' } },
+        h('span', { style: { color: TXT4, fontSize: '0.6875rem', marginRight: 'auto' } }, 'Revert is itself a save, so it can be undone from here too.'),
+        h('button', { onClick: revert, disabled: busy || one.isFetching || !v.diff, style: { ...primaryButton(busy || one.isFetching || !v.diff), padding: '3px 12px', fontSize: '0.75rem' } }, busy ? 'Reverting…' : 'Revert to this version')
+      )
+    )
+  }
+
+  return h(
+    'div',
+    { style: { marginBottom: '8px', padding: '8px', borderRadius: RADIUS, border: '1px solid ' + STROKE } },
+    h(SectionLabel, { text: 'History: ' + what }),
+    h(
+      'div',
+      { style: { marginTop: '4px' } },
+      gate(list, 'history') ||
+        (versions.length
+          ? h(
+              'div',
+              { style: { maxHeight: '9rem', overflowY: 'auto' } },
+              versions.map((ver) =>
+                h(
+                  ListRow,
+                  { key: ver.id, compact: true, active: ver.id === picked, onClick: () => { setPicked(ver.id === picked ? null : ver.id); setErr(null) } },
+                  h(
+                    'div',
+                    { style: { display: 'flex', justifyContent: 'space-between', gap: '8px', fontSize: '0.75rem' } },
+                    h('span', {}, localTime(ver.saved_at)),
+                    h('span', { style: { color: TXT4 } }, fmtBytes(ver.size))
+                  )
+                )
+              )
+            )
+          : h('div', { style: { color: TXT3, fontSize: '0.75rem' } }, 'No earlier versions yet. One is kept each time this is saved.'))
+    ),
+    preview()
+  )
+}
+
 // Shows text, and with onSave an Edit button that swaps it for a textarea in place.
 // The text at the moment Edit is clicked is what the save claims to replace, so polling can refresh
 // `value` underneath an open editor without losing the draft or hiding a concurrent change.
@@ -651,12 +989,16 @@ function CodeArea({ value, lang, maxHeight, onChange, onKeyDown }) {
 // With maxHeight only the text scrolls, so the buttons above it and the box below it stay in view.
 // Without it the box sticks to the bottom of a scrolling parent, so on a long text it stays in view.
 // With lang, the text shows as highlighted code with line numbers and edits in CodeArea.
-function TextEditor({ value, onSave, hint, ask, maxHeight, lang }) {
+// history ({ ctx, kind, ref, what }), with onSave, adds a "History" button that lists earlier versions to revert to.
+// impact, when given, sits beside Save: what the change reaches.
+function TextEditor({ value, onSave, hint, ask, maxHeight, lang, history, impact }) {
   const [draft, setDraft] = useState(null)
   const [base, setBase] = useState('')
   const [err, setErr] = useState(null)
   const [busy, setBusy] = useState(false)
   const [asking, setAsking] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const canRevert = !!(history && onSave)
 
   if (draft === null) {
     return h(
@@ -669,9 +1011,11 @@ function TextEditor({ value, onSave, hint, ask, maxHeight, lang }) {
             ask
               ? h('button', { onClick: () => setAsking(!asking), style: asking ? { ...smallButton, borderColor: ACCENT, color: TXT1 } : smallButton }, '✦ Ask agent')
               : null,
-            onSave ? h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null); setAsking(false) }, style: smallButton }, '✎ Edit') : null
+            canRevert ? h(HistoryButton, { open: showHistory, onClick: () => setShowHistory(!showHistory) }) : null,
+            onSave ? h('button', { onClick: () => { setBase(value); setDraft(value); setErr(null); setAsking(false); setShowHistory(false) }, style: smallButton }, '✎ Edit') : null
           )
         : null,
+      canRevert && showHistory ? h(HistoryPanel, { history, onDone: () => setShowHistory(false) }) : null,
       lang
         ? h(CodeArea, { value, lang, maxHeight })
         : maxHeight
@@ -731,7 +1075,12 @@ function TextEditor({ value, onSave, hint, ask, maxHeight, lang }) {
     h(
       'div',
       { style: { marginTop: '6px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' } },
-      h('span', { style: { color: TXT4, fontSize: '0.6875rem', marginRight: 'auto' } }, '⌘/Ctrl+Enter to save · Esc to cancel'),
+      h(
+        'div',
+        { style: { marginRight: 'auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '2px' } },
+        impact || null,
+        h('span', { style: { color: TXT4, fontSize: '0.6875rem' } }, '⌘/Ctrl+Enter to save · Esc to cancel')
+      ),
       h('button', { onClick: () => setDraft(null), style: smallButton }, 'Cancel'),
       h('button', { onClick: submit, disabled: busy || draft === base, style: { ...primaryButton(busy || draft === base), padding: '3px 12px', fontSize: '0.75rem' } }, busy ? 'Saving…' : 'Save')
     )
@@ -777,13 +1126,43 @@ function ChipList({ label, items, tone, onPick }) {
   )
 }
 
+function UsedBy({ items, onCron, onWebhook }) {
+  if (!items || !items.length) return null
+  return h(
+    'div',
+    { style: { marginTop: '8px' } },
+    h(SectionLabel, { text: 'Used by' }),
+    h(
+      'div',
+      { style: { marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '2px', alignItems: 'flex-start' } },
+      items.map((u) => {
+        const cron = u.kind === 'cron'
+        const go = cron ? onCron : onWebhook
+        return h(
+          'button',
+          {
+            key: u.kind + ':' + (u.id || u.name),
+            onClick: () => go && go(u.name),
+            title: cron ? 'Open in the Crons tab' : 'Open in the Webhooks tab',
+            style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '2px 0', border: 'none', background: 'transparent', color: TXT2, fontSize: '0.8125rem', cursor: 'pointer', textAlign: 'left' },
+          },
+          cron ? h(StatusDot, { item: u }) : null,
+          h(Badge, {}, u.kind),
+          h('span', {}, u.name),
+          cron ? h(StatusText, { item: u }) : null,
+          u.deliver ? h('span', { style: { color: TXT3, fontSize: '0.75rem' } }, '→ ' + u.deliver) : null
+        )
+      })
+    )
+  )
+}
 
 const SKILL_VIEWS = [
   { id: 'workflow', label: 'Workflow' },
   { id: 'md', label: 'SKILL.md' },
 ]
 
-function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron }) {
+function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron, onWebhook }) {
   const editable = detail.editable && canEdit(profile)
   return h(
     Fragment,
@@ -804,6 +1183,8 @@ function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron }) {
           h(TextEditor, {
             value: detail.raw,
             hint: 'Full SKILL.md: YAML frontmatter (--- … ---) then the markdown body. Validated on save.',
+            history: editable ? historyOf(ctx, 'skill', detail.name, detail.name) : null,
+            impact: editable ? impactNote(detail.used_by) : null,
             onSave: editable
               ? (content, expected) => save(ctx, '/skills/' + encodeURIComponent(detail.name), { content, expected }, detail.name)
               : null,
@@ -831,7 +1212,7 @@ function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron }) {
           }),
           h(ChipList, { label: 'Credentials', items: detail.credentials, tone: 'accent' }),
           h(ChipList, { label: 'Related skills', items: detail.related_skills, onPick: onSwitch }),
-          h(ChipList, { label: 'Used by crons', items: detail.used_by_crons, onPick: onCron })
+          h(UsedBy, { items: detail.used_by, onCron, onWebhook })
         )
   )
 }
@@ -945,6 +1326,7 @@ function SkillsTab({ ctx, profile, nav, onNavigate }) {
                 onView: setView,
                 onSwitch: open,
                 onCron: (cron) => onNavigate('crons', cron),
+                onWebhook: (route) => onNavigate('webhooks', route),
                 ctx,
                 profile,
               })
@@ -1143,7 +1525,7 @@ function ScriptBody({ ctx, profile, script, onSave, ask, maxHeight }) {
     {},
     h('div', { style: { color: TXT4, fontSize: '0.6875rem', fontFamily: MONO, marginBottom: '8px', overflowWrap: 'anywhere' } }, s.path),
     s.truncated ? h('div', { style: { color: AMBER, fontSize: '0.75rem', marginBottom: '8px' } }, 'Showing the first ' + s.content.length + ' of ' + s.size + ' bytes. Too large to edit here.') : null,
-    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask, maxHeight, lang: scriptLang(s.path, s.content) })
+    h(TextEditor, { value: s.content, onSave: s.truncated ? null : onSave, ask, maxHeight, lang: scriptLang(s.path, s.content), history: s.ref ? historyOf(ctx, 'script', s.ref, s.path) : null })
   )
 }
 
@@ -1177,10 +1559,11 @@ function TargetRow({ entry }) {
 
 // A cron's deliver value is a comma list of tokens (local, origin, a platform's home channel, platform:chat).
 // The backend resolves each with the scheduler's own code, so this shows where a run's output really goes.
-function DeliverBody({ ctx, profile, step, onSave }) {
+function DeliverBody({ ctx, profile, step, onSave, history }) {
   const [draft, setDraft] = useState(null)
   const [err, setErr] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
   const q = useQuery({
     queryKey: [ID, 'delivery', profile, step.job_id, step.deliver],
     queryFn: () => ctx.rest(withProfile('/crons/' + encodeURIComponent(step.job_id) + '/delivery', profile)),
@@ -1193,8 +1576,9 @@ function DeliverBody({ ctx, profile, step, onSave }) {
 
   const header = h(
     'div',
-    { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '6px' } },
-    onSave && draft === null ? h('button', { onClick: () => { setDraft(d.deliver); setErr(null) }, style: smallButton }, '✎ Edit') : null
+    { style: { display: 'flex', justifyContent: 'flex-end', gap: '6px', marginBottom: '6px' } },
+    onSave && history && draft === null ? h(HistoryButton, { open: showHistory, onClick: () => setShowHistory(!showHistory) }) : null,
+    onSave && draft === null ? h('button', { onClick: () => { setDraft(d.deliver); setErr(null); setShowHistory(false) }, style: smallButton }, '✎ Edit') : null
   )
   const view = h(
     Fragment,
@@ -1211,7 +1595,7 @@ function DeliverBody({ ctx, profile, step, onSave }) {
         )
       : null
   )
-  if (draft === null) return h(Fragment, {}, header, view)
+  if (draft === null) return h(Fragment, {}, header, onSave && history && showHistory ? h(HistoryPanel, { history, onDone: () => setShowHistory(false) }) : null, view)
 
   const picked = tokens(draft)
   // "local" means send nowhere, so it replaces every other pick and any other pick replaces it.
