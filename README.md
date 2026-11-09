@@ -4,8 +4,11 @@ n8n-style flows for your Hermes skills and crons.
 
 Ariadne's Thread adds a page to Hermes Desktop that draws each cron job, webhook route, and skill as a chain of steps. A cron shows its script, prompt, attached skills, and delivery target. A skill shows the steps it describes, read from its `SKILL.md`. Open any step to read it, edit it right there, or draft a change request for it in a new chat.
 
-<!-- Screenshot: Crons tab with a selected job and its flow -->
-<!-- Screenshot: Skills tab with a parsed skill flow -->
+![Crons tab with a selected job and its flow](docs/crons.png)
+
+![Skills tab with a parsed skill flow](docs/skill-flow.png)
+
+![A skill step open for editing](docs/edit-step.png)
 
 ## Install
 
@@ -17,10 +20,10 @@ Install it from the plugin catalog:
 hermes plugins install ariadne-thread
 ```
 
-Until the catalog entry exists, install it from its GitHub repository (the URL in the author line at the end of this file). Pin a full commit SHA:
+Until the catalog entry exists, install it from its [GitHub repository](https://github.com/benoit-dev/ariadne-thread). Pin a full commit SHA:
 
 ```sh
-hermes plugins install <owner>/ariadne-thread --ref <40-character commit sha>
+hermes plugins install benoit-dev/ariadne-thread --ref <40-character commit sha>
 ```
 
 Hermes installs plugins disabled. To enable it, answer yes to the prompt or run:
@@ -42,7 +45,7 @@ Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
   - **Config** shows when the job runs next (relative and as a date), then its `model`, `provider`, `enabled_toolsets`, `profile`, `workdir`, `context_from`, `repeat` and `no_agent`, when set. It never shows `base_url`, and it hides any value that looks like a key, a token, or a URL with a password in it.
   - **Thread** shows the skills the job loads and where its output goes. Click a skill to open it.
   - **Runs** lists the latest output files Hermes saved for the job in `cron/output/<job id>/`, with their time and size. Click one to read it. At most the first 256 KB is shown.
- Click a step to expand it in place: a script step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step shows where each target in `deliver` resolves (platform, chat and thread, by the scheduler's own rules), or why it sends nothing, such as a platform with no home channel. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
+- Click a step to expand it in place: a script step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step shows where each target in `deliver` resolves (platform, chat and thread, by the scheduler's own rules), or why it sends nothing, such as a platform with no home channel. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
 - **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow. Its steps open the same way.
 - **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. A selected skill has two views: **Workflow** shows its flow, its related skills, and **Used by**, which lists every cron and webhook that loads the skill with the cron's status and where each one delivers. **SKILL.md** shows the whole file.
 
@@ -115,8 +118,12 @@ It does not:
 - run, pause, or resume cron jobs. **Runs** only reads the output files Hermes already wrote.
 - start agent sessions or send messages for you
 - call any network service other than the Hermes backend it is installed in
-- read credentials, `.env` files, or tokens
+- read credentials, `.env` files, or tokens itself
 - collect telemetry
+
+It reads no credentials itself, but two calls into Hermes do. To show where a cron job delivers, it calls Hermes' scheduler, which reads `<PLATFORM>_HOME_CHANNEL` values from Hermes' secrets. For another profile, it first enters that profile's config and secret scope through Hermes, so the scheduler reads that profile's values. The UI shows only the resolved platform, chat and thread.
+
+Hermes has no public seam for some of this work, so the backend has 9 private Hermes imports for cron delivery targets, cron and webhook edits, and profile scoping. A Hermes release can change them. [docs/risk-audit.md](docs/risk-audit.md#core-imports) lists each one and what happens if it goes away.
 
 After a save, it sends the local event `plugin.ariadne-thread.skills.changed` to open Desktop windows so that they refresh.
 
@@ -163,5 +170,3 @@ hermes plugins doctor . --ci
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-Author: benoit-dev (https://github.com/benoit-dev/ariadne-thread)
