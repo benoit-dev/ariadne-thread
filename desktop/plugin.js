@@ -35,6 +35,8 @@ const GREEN = 'var(--ui-green, #22c55e)'
 const BLUE = 'var(--ui-blue, #3b82f6)'
 // Hermes's own corner radius: follows the theme, and the default theme renders it at about 2px.
 const RADIUS = 'var(--radius-md, 2px)'
+// Hermes's --ui-bg-input stays #fcfcfc in dark mode, so fields use the card surface, which follows the theme.
+const FIELD_BG = 'var(--ui-bg-editor, rgba(128,128,128,0.10))'
 const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace'
 
 const mix = (color, pct) => 'color-mix(in srgb, ' + color + ' ' + pct + '%, transparent)'
@@ -1288,7 +1290,7 @@ function SkillsTab({ ctx, profile, nav, onNavigate }) {
     value: filter,
     onChange: (e) => setFilter(e.target.value),
     placeholder: 'Filter skills',
-    style: { margin: '8px', padding: '5px 8px', fontSize: '0.75rem', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit', outline: 'none' },
+    style: { margin: '8px', padding: '5px 8px', fontSize: '0.75rem', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: FIELD_BG, color: TXT1, outline: 'none' },
   })
   const list = groups.length
     ? groups.map(([category, items]) =>
@@ -1473,7 +1475,7 @@ function AgentBox({ ctx, buildPrompt, label, placeholder, onClose }) {
     ),
     h(
       'div',
-      { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '6px 6px 6px 10px', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)' } },
+      { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', padding: '6px 6px 6px 10px', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: FIELD_BG } },
       h('textarea', {
         ref,
         rows: 2,
@@ -1706,9 +1708,9 @@ function ProfileSelect({ ctx, profile, onChange }) {
       value: profile,
       onChange: (e) => onChange(e.target.value),
       title: 'Profile',
-      style: { marginLeft: 'auto', padding: '3px 6px', fontSize: '0.75rem', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: 'var(--ui-bg-input, transparent)', color: 'inherit' },
+      style: { marginLeft: 'auto', padding: '3px 6px', fontSize: '0.75rem', borderRadius: RADIUS, border: '1px solid ' + STROKE, background: FIELD_BG, color: TXT1 },
     },
-    profiles.map((p) => h('option', { key: p, value: p }, p))
+    profiles.map((p) => h('option', { key: p, value: p, style: { background: 'var(--ui-bg-elevated, #1f2937)', color: TXT1 } }, p))
   )
 }
 
