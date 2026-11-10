@@ -8,7 +8,7 @@ Ariadne's Thread adds a page to Hermes Desktop that draws each cron job, webhook
 
 ![Skills tab with a parsed skill flow](docs/skill-flow.png)
 
-![A skill step open for editing](docs/edit-step.png)
+![Webhooks tab with a route and its flow](docs/webhook-flow.png)
 
 ## Install
 
