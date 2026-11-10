@@ -77,7 +77,7 @@ router = APIRouter()
 _log = logging.getLogger("ariadne-thread")
 
 PLUGIN_NAME = "ariadne-thread"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.1"
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_SCRIPT_BYTES = 256 * 1024
 HISTORY_KEEP = 10

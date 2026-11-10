@@ -86,7 +86,7 @@ def test_empty_home_has_empty_lists_and_no_errors(client):
     assert client.get("/profiles").json() == {"profiles": ["default"]}
     health = client.get("/health").json()
     assert health["name"] == "ariadne-thread"
-    assert health["version"] == "0.2.0"
+    assert health["version"] == "0.2.1"
     assert health["sources"] == {"crons": False, "webhooks": False, "skills_root": False}
 
 
@@ -1106,16 +1106,16 @@ def test_empty_config_values_are_left_out(client, home):
 @pytest.mark.parametrize(
     "key, value",
     [
-        ("model", "sk-proj-abcdefghijklmnop"),
-        ("provider", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+        ("model", "sk-proj-FAKEFAKEFAKE"),
+        ("provider", "ghp_FAKEFAKEFAKEFAKE"),
         ("workdir", "https://deploy:hunter2@git.example.com/repo.git"),
         ("workdir", "https://git.example.com/repo.git?access_token=abc123"),
-        ("model", "AKIAIOSFODNN7EXAMPLE"),
-        ("provider", "xoxb-1234-5678-abcdefghij"),
+        ("model", "AKIAFAKEFAKEFAKEFAKE"),
+        ("provider", "xoxb-FAKE-FAKE-FAKE"),
         ("model", "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
         ("model", "dGhpcyBpcyBhIHNlY3JldCBrZXkgdGhhdCBpcyBsb25nIGVub3VnaA=="),
-        ("enabled_toolsets", ["web", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"]),
-        ("repeat", {"times": 2, "note": "xoxp-0000-1111-aaaaaaaa"}),
+        ("enabled_toolsets", ["web", "ghp_FAKEFAKEFAKEFAKE"]),
+        ("repeat", {"times": 2, "note": "xoxp-FAKE-FAKE-FAKE"}),
     ],
 )
 def test_a_config_value_that_looks_like_a_credential_is_dropped(client, home, key, value):
@@ -1125,7 +1125,7 @@ def test_a_config_value_that_looks_like_a_credential_is_dropped(client, home, ke
 
 
 def test_a_credential_in_one_field_does_not_hide_the_others(client, home):
-    job = cron_job(client, home, model="sk-proj-abcdefghijklmnop", provider="openai", workdir="/srv/app")
+    job = cron_job(client, home, model="sk-proj-FAKEFAKEFAKE", provider="openai", workdir="/srv/app")
 
     assert job["config"] == {"provider": "openai", "workdir": "/srv/app"}
 

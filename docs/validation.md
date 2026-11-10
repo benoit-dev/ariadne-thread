@@ -1,12 +1,12 @@
 # Validation
 
-These runs used a fresh empty `HERMES_HOME` for each command. The package passes on the current release (Hermes v0.22.7) and on the declared floor (Hermes v0.22.0).
+These runs checked 0.2.1 with a fresh empty `HERMES_HOME` for each command. The package passes on the current release (Hermes v0.23.0) and on the declared floor (Hermes v0.22.0).
 
-## Hermes v0.22.7
+## Hermes v0.23.0
 
 ```text
 $ hermes --version
-Hermes Agent v0.22.7 (2026.9.24) · stable · local b200f5bc60e3
+Hermes Agent v0.23.0 (2026.9.24) · stable · local 2bd378ed1b8d
 
 $ hermes plugins validate . --install-deps
 Preparing the isolated Hermes runtime…
@@ -50,15 +50,13 @@ Validation passed.
 
 $ hermes plugins doctor . --ci
 Plugin Doctor: .
-  manifest: ariadne-thread 0.2.0 (standalone)
+  manifest: ariadne-thread 0.2.1 (standalone)
   OK: runtime discovery, manifest parsing, import, and registration passed
   registrations: 0 tool(s), 0 hook(s)
 (exit code 0)
 ```
 
 ## Hermes v0.22.0
-
-The v0.22.0 checkout ran on the v0.22.7 virtual environment's Python, which has the dependencies installed.
 
 ```text
 $ hermes --version
@@ -105,7 +103,7 @@ Validation passed.
 
 $ hermes plugins doctor . --ci
 Plugin Doctor: .
-  manifest: ariadne-thread 0.2.0 (standalone)
+  manifest: ariadne-thread 0.2.1 (standalone)
   OK: runtime discovery, manifest parsing, import, and registration passed
   registrations: 0 tool(s), 0 hook(s)
 (exit code 0)
@@ -113,30 +111,30 @@ Plugin Doctor: .
 
 ## Warnings
 
-`validate` passes on both versions and prints one warning: catalog rule 9, private core imports. It lists `cron.jobs`, `cron.scheduler_delivery`, `gateway.channel_directory`, `hermes_cli.web_server_profiles._config_profile_scope` and three `hermes_cli.webhook` functions. The same warning, with the same imports, appears on 0.1.0 at `origin/main` `9f4ca3d`; 0.2.0 adds no new core import. [risk-audit.md](risk-audit.md#core-imports) explains why each one is needed.
+`validate` passes on both versions and prints one warning: catalog rule 9, private core imports. It lists `cron.jobs`, `cron.scheduler_delivery`, `gateway.channel_directory`, `hermes_cli.web_server_profiles._config_profile_scope` and three `hermes_cli.webhook` functions. The same warning, with the same imports, appears on 0.1.0 at `origin/main` `9f4ca3d`; 0.2.0 and 0.2.1 add no new core import. [risk-audit.md](risk-audit.md#core-imports) explains why each one is needed.
 
 Before `__init__.py` existed, `validate` warned `no __init__.py — capability probe skipped (manifest-only plugin)`, and `doctor --ci` reported `ERROR: Plugin registration failed: No __init__.py`. The empty `register(ctx)` in `__init__.py` fixes both.
 
 ## Tests
 
 ```text
-$ python -m pytest -q tests          # Hermes v0.22.7
-157 passed, 1 warning in 10.18s
+$ python -m pytest -q tests          # Hermes v0.23.0
+157 passed, 1 warning in 11.28s
 (exit code 0)
 
 $ PYTHONPATH=<v0.22.0 checkout> python -m pytest -q tests          # Hermes v0.22.0 modules
-157 passed, 1 warning in 10.12s
+157 passed in 10.76s
 (exit code 0)
 ```
 
-The one warning is Starlette's deprecation notice for `httpx` in its test client.
+The one warning is Starlette's deprecation notice for `httpx` in its test client. The v0.22.0 run uses a virtual environment whose Starlette does not print it.
 
 ## API against an empty HERMES_HOME
 
 This run mounts the router in a test app and calls each endpoint with an empty home folder.
 
 ```text
-GET /health -> 200 {"ok":true,"name":"ariadne-thread","version":"0.2.0","sources":{"crons":false,"webhooks":false,"skills_root":false}}
+GET /health -> 200 {"ok":true,"name":"ariadne-thread","version":"0.2.1","sources":{"crons":false,"webhooks":false,"skills_root":false}}
 GET /profiles -> 200 {"profiles":["default"]}
 GET /crons -> 200 {"jobs":[],"total":0,"categories":{},"updated_at":""}
 GET /webhooks -> 200 {"routes":[]}

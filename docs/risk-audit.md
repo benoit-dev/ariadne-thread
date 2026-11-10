@@ -72,4 +72,4 @@ There are none. The plugin does not call `subprocess`, `os.system`, `session.cre
 
 ### Credentials
 
-The plugin reads no secrets, `.env` files, or tokens. It never returns a cron job's `base_url` and drops any displayed config value that looks like a credential. It shows the names of a skill's declared credentials (`credentials`, `required_environment_variables`) and never their values.
+The plugin reads no secrets, `.env` files, or tokens itself. To resolve cron delivery targets it calls Hermes' scheduler, which reads `<PLATFORM>_HOME_CHANNEL` values through Hermes' secret store; for another profile it first enters that profile's config and secret scope (`_profile_secrets`, `dashboard/plugin_api.py:1356-1369`). It never returns a cron job's `base_url` and drops any displayed config value that looks like a credential. It shows the names of a skill's declared credentials (`credentials`, `required_environment_variables`) and never their values.
