@@ -1,7 +1,7 @@
 // Disk plugins are loaded uncompiled, so the UI is built with jsx()/jsxs() calls, not JSX.
 //
-// Data comes from ctx.rest through React Query. Live updates arrive as native
-// 'cron.changed' and as the backend's 'plugin.ariadne-thread.skills.changed' push, but
+// Data comes from ctx.rest through React Query, plus two of Hermes' own read routes (useCore).
+// Live updates arrive as native 'cron.changed' and as the backend's 'plugin.ariadne-thread.skills.changed' push, but
 // push can drop on some remotes, so every query also polls.
 
 import {
@@ -97,6 +97,25 @@ const withProfile = (path, profile) =>
 
 const errorText = (e) => (e && e.message) || String(e)
 
+// Hermes' own read routes (/api/webhooks, /api/cron/delivery-targets). ctx.rest only reaches this
+// plugin's namespace, so these go through the desktop bridge. They always name the profile, and
+// "default" is whichever profile this plugin's backend serves.
+function useCore(ctx, path, profile) {
+  const served = useQuery({ queryKey: [ID, 'profiles'], queryFn: () => ctx.rest('/profiles'), refetchInterval: POLL_MS * 5 })
+  const name =
+    profile && profile !== 'default' ? profile : served.data ? served.data.serving || 'default' : served.isError ? 'default' : null
+  return useQuery({
+    queryKey: [ID, 'core', path, name],
+    enabled: !!name,
+    queryFn: () => {
+      const bridge = window.hermesDesktop
+      if (!bridge || typeof bridge.api !== 'function') throw new Error('the Hermes desktop bridge is unavailable')
+      return bridge.api({ path: path + '?profile=' + encodeURIComponent(name) })
+    },
+    refetchInterval: POLL_MS,
+  })
+}
+
 // Edits are only offered on the host's own profile; the backend refuses the others too.
 const canEdit = (profile) => !profile || profile === 'default'
 
@@ -146,14 +165,12 @@ const cronStepEdit = (ctx, job) => (step) => {
   }
 }
 
+// Hermes has no route to change one field of a webhook yet, so its prompt is read-only here and
+// "Ask agent" drafts the change for a chat instead.
 const webhookStepEdit = (ctx, route) => (step) => {
   if (step.script) return scriptEdit(ctx, step.script, 'webhook route "' + route.name + '"')
   if (step.type !== 'prompt') return null
-  return {
-    save: (content, expected) => save(ctx, '/webhooks/' + encodeURIComponent(route.name) + '/prompt', { expected, content }, 'the prompt of ' + route.name),
-    ask: (request) => webhookPromptPrompt(route, step.body, request),
-    history: historyOf(ctx, 'webhook-prompt', route.name, 'the prompt of ' + route.name),
-  }
+  return { ask: (request) => webhookPromptPrompt(route, step.body, request) }
 }
 
 const skillStepEdit = (ctx, detail) => (step) =>
@@ -637,13 +654,23 @@ function CronsTab({ ctx, profile, nav, onOpenSkill }) {
   )
 }
 
+const webhookRoutes = (q) =>
+  ((q.data && q.data.subscriptions) || []).slice().sort((a, b) => a.name.localeCompare(b.name))
+
+function webhookSequence(route) {
+  const steps = [{ type: 'trigger', kind: 'trigger', label: route.name + ' · POST', detail: '/webhooks/' + route.name, kindLabel: 'webhook' }]
+  if (route.script) steps.push({ type: 'script', kind: 'script', label: 'Script', detail: route.script, kindLabel: 'script', script: route.script })
+  const prompt = route.prompt || ''
+  steps.push({ type: 'prompt', kind: 'prompt', label: 'Prompt', detail: prompt.slice(0, 200), kindLabel: 'prompt', body: prompt })
+  for (const skill of route.skills || []) steps.push({ type: 'skill', kind: 'skill', label: skill, name: skill, kindLabel: 'skill' })
+  const deliver = route.deliver || 'log'
+  steps.push({ type: 'deliver', kind: 'deliver', label: deliver, detail: route.deliver_only ? 'Sends the rendered prompt as is, without an agent run' : '', kindLabel: deliver })
+  return steps
+}
+
 function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
   const [selected, setSelected] = useState(null)
-  const q = useQuery({
-    queryKey: [ID, 'webhooks', profile],
-    queryFn: () => ctx.rest(withProfile('/webhooks', profile)),
-    refetchInterval: POLL_MS,
-  })
+  const q = useCore(ctx, '/api/webhooks', profile)
 
   useEffect(() => {
     if (nav && nav.to === 'webhooks' && nav.item) setSelected(nav.item)
@@ -651,7 +678,7 @@ function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
 
   const failed = gate(q, 'webhooks')
   if (failed) return h(ListDetail, { list: failed })
-  const routes = (q.data && q.data.routes) || []
+  const routes = webhookRoutes(q)
   if (!routes.length) return h(ListDetail, { list: h(Note, { text: 'No webhooks' }) })
   const route = pick(routes, selected)
 
@@ -666,13 +693,18 @@ function WebhooksTab({ ctx, profile, nav, onOpenSkill }) {
         )
       ),
     },
-    h('div', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, route.name),
+    h(
+      'div',
+      { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+      h('span', { style: { fontSize: '0.9375rem', fontWeight: 600, color: TXT2 } }, route.name),
+      route.enabled === false ? h(Badge, {}, 'disabled') : null
+    ),
     route.description ? h('div', { style: { fontSize: '0.8125rem', color: TXT3, marginTop: '4px' } }, route.description) : null,
-    h('div', { style: { fontSize: '0.75rem', color: TXT3, marginTop: '4px', fontFamily: MONO } }, route.path),
+    h('div', { style: { fontSize: '0.75rem', color: TXT3, marginTop: '4px', fontFamily: MONO } }, '/webhooks/' + route.name),
     route.events && route.events.length
       ? h('div', { style: { marginTop: '8px', display: 'flex', gap: '4px', flexWrap: 'wrap' } }, route.events.map((e) => h(Badge, { key: e }, e)))
       : h('div', { style: { marginTop: '8px' } }, h(Badge, {}, 'all events')),
-    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { key: route.name, sequence: route.sequence, ctx, profile, edit: canEdit(profile) ? webhookStepEdit(ctx, route) : null, onOpenSkill: (name) => onOpenSkill(name, { to: 'webhooks', item: route.name, kind: 'webhook' }) }))
+    h('div', { style: { marginTop: '16px' } }, h(Pipeline, { key: route.name, sequence: webhookSequence(route), ctx, profile, edit: canEdit(profile) ? webhookStepEdit(ctx, route) : null, onOpenSkill: (name) => onOpenSkill(name, { to: 'webhooks', item: route.name, kind: 'webhook' }) }))
   )
 }
 
@@ -1164,7 +1196,17 @@ const SKILL_VIEWS = [
   { id: 'md', label: 'SKILL.md' },
 ]
 
-function SkillDetail({ detail, ctx, profile, view, onView, onSwitch, onCron, onWebhook }) {
+// The backend lists the crons that use a skill; the webhook routes come from /api/webhooks.
+function useUsedBy(ctx, profile, detail) {
+  const routes = webhookRoutes(useCore(ctx, '/api/webhooks', profile))
+  const hooks = routes
+    .filter((r) => (r.skills || []).some((s) => s.split('/').pop() === detail.name))
+    .map((r) => ({ kind: 'webhook', name: r.name, deliver: r.deliver || '' }))
+  return (detail.used_by || []).concat(hooks)
+}
+
+function SkillDetail({ detail: base, ctx, profile, view, onView, onSwitch, onCron, onWebhook }) {
+  const detail = { ...base, used_by: useUsedBy(ctx, profile, base) }
   const editable = detail.editable && canEdit(profile)
   return h(
     Fragment,
@@ -1382,7 +1424,7 @@ const webhookPromptPrompt = (route, current, request) =>
   changePrompt(
     [
       'Please update the prompt template of the Hermes webhook route "' + route.name + '".',
-      'Leave its secret and every other field unchanged.',
+      'Leave its secret and every other field unchanged. `hermes webhook subscribe ' + route.name + '` replaces the whole route, so pass every existing setting again.',
       '',
       'Current prompt template:',
       fenced(current),
@@ -1531,69 +1573,71 @@ function ScriptBody({ ctx, profile, script, onSave, ask, maxHeight }) {
   )
 }
 
-const VIA = { origin: 'origin chat', origin_fallback: 'home channel (no origin chat)', home: 'home channel', explicit: '' }
+// What one stored deliver token means, read against Hermes' list of delivery targets.
+function tokenNote(token, targets) {
+  const lower = token.toLowerCase()
+  if (lower === 'origin') return { text: 'the chat the job was created from, else a home channel' }
+  if (lower === 'all') return { text: 'every platform that has a home channel' }
+  const colon = token.indexOf(':')
+  if (colon > 0) {
+    const [chat, thread] = token.slice(colon + 1).split(':')
+    return { text: 'chat ' + chat + (thread ? ' (thread ' + thread + ')' : '') + ' on ' + token.slice(0, colon) }
+  }
+  const t = targets.find((x) => x.id === lower)
+  if (!t) return { warn: true, text: 'not a delivery platform set up in Hermes' }
+  if (!t.home_target_set) return { warn: true, text: 'no home channel is set' + (t.home_env_var ? ' (' + t.home_env_var + ')' : '') + '; run /sethome there' }
+  return { text: 'its home channel' }
+}
 
-function TargetRow({ entry }) {
-  const mono = { fontFamily: MONO, fontSize: '0.75rem' }
-  const where = (t) =>
-    [t.platform, t.name ? t.name + ' (' + t.chat_id + ')' : t.chat_id || 'own profile', t.thread_id ? 'thread ' + t.thread_id : null].filter(Boolean).join(' · ')
+function TargetRow({ token, targets }) {
+  const note = tokenNote(token, targets)
   return h(
     'div',
     { style: { display: 'flex', gap: '8px', alignItems: 'baseline', padding: '4px 0', borderTop: '1px solid ' + STROKE } },
-    h('span', { style: { ...mono, color: TXT2, minWidth: '110px', overflowWrap: 'anywhere' } }, entry.token),
+    h('span', { style: { fontFamily: MONO, fontSize: '0.75rem', color: TXT2, minWidth: '110px', overflowWrap: 'anywhere' } }, token),
     h('span', { style: { color: TXT4, fontSize: '0.75rem' } }, '→'),
-    h(
-      'div',
-      { style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 } },
-      entry.targets.length
-        ? entry.targets.map((t, i) =>
-            h(
-              'div',
-              { key: i, style: { fontSize: '0.75rem', color: TXT2, overflowWrap: 'anywhere' } },
-              where(t),
-              VIA[t.via] ? h('span', { style: { color: TXT4 } }, '  · ' + VIA[t.via]) : null
-            )
-          )
-        : h('div', { style: { fontSize: '0.75rem', color: AMBER } }, '⚠ Not sent: ' + entry.error)
-    )
+    h('span', { style: { fontSize: '0.75rem', color: note.warn ? AMBER : TXT2, overflowWrap: 'anywhere' } }, (note.warn ? '⚠ Not sent: ' : '') + note.text)
   )
 }
 
 // A cron's deliver value is a comma list of tokens (local, origin, a platform's home channel, platform:chat).
-// The backend resolves each with the scheduler's own code, so this shows where a run's output really goes.
+// Each token is shown as stored, with whether Hermes' /api/cron/delivery-targets says its platform can receive.
 function DeliverBody({ ctx, profile, step, onSave, history }) {
   const [draft, setDraft] = useState(null)
   const [err, setErr] = useState(null)
   const [busy, setBusy] = useState(false)
   const [showHistory, setShowHistory] = useState(false)
-  const q = useQuery({
-    queryKey: [ID, 'delivery', profile, step.job_id, step.deliver],
-    queryFn: () => ctx.rest(withProfile('/crons/' + encodeURIComponent(step.job_id) + '/delivery', profile)),
-    refetchInterval: POLL_MS,
-  })
+  const q = useCore(ctx, '/api/cron/delivery-targets', profile)
   const failed = gate(q, 'delivery targets')
   if (failed) return failed
-  const d = q.data
+  const targets = (q.data && q.data.targets) || []
+  const deliver = step.deliver || 'local'
   const tokens = (v) => v.split(',').map((t) => t.trim()).filter(Boolean)
+  const sent = (v) => tokens(v).filter((t) => t !== 'local')
+  const options = [
+    { id: 'local', name: 'Local (save only)', ready: true },
+    { id: 'origin', name: 'Origin chat', ready: true },
+    ...targets.filter((t) => t.id && t.id !== 'local').map((t) => ({ id: t.id, name: t.name || t.id, ready: !!t.home_target_set })),
+  ]
 
   const header = h(
     'div',
     { style: { display: 'flex', justifyContent: 'flex-end', gap: '6px', marginBottom: '6px' } },
     onSave && history && draft === null ? h(HistoryButton, { open: showHistory, onClick: () => setShowHistory(!showHistory) }) : null,
-    onSave && draft === null ? h('button', { onClick: () => { setDraft(d.deliver); setErr(null); setShowHistory(false) }, style: smallButton }, '✎ Edit') : null
+    onSave && draft === null ? h('button', { onClick: () => { setDraft(deliver); setErr(null); setShowHistory(false) }, style: smallButton }, '✎ Edit') : null
   )
   const view = h(
     Fragment,
     {},
-    d.targets.length
-      ? d.targets.map((e, i) => h(TargetRow, { key: i, entry: e }))
+    sent(deliver).length
+      ? sent(deliver).map((t) => h(TargetRow, { key: t, token: t, targets }))
       : h('div', { style: { fontSize: '0.75rem', color: TXT3 } }, 'Local only: the output is saved with the run and not sent anywhere.'),
-    d.failure_deliver
+    step.failure_deliver
       ? h(
           'div',
           { style: { marginTop: '10px' } },
-          h(SectionLabel, { text: 'Failures go to: ' + d.failure_deliver }),
-          d.failure_targets.map((e, i) => h(TargetRow, { key: i, entry: e }))
+          h(SectionLabel, { text: 'Failures go to: ' + step.failure_deliver }),
+          sent(step.failure_deliver).map((t) => h(TargetRow, { key: t, token: t, targets }))
         )
       : null
   )
@@ -1610,14 +1654,14 @@ function DeliverBody({ ctx, profile, step, onSave, history }) {
     setBusy(true)
     setErr(null)
     try {
-      await onSave(draft, d.deliver)
+      await onSave(draft, deliver)
       setDraft(null)
     } catch (e) {
       setErr(errorText(e))
     }
     setBusy(false)
   }
-  const unchanged = tokens(draft).join(',') === d.deliver
+  const unchanged = tokens(draft).join(',') === deliver
   return h(
     Fragment,
     {},
@@ -1625,7 +1669,7 @@ function DeliverBody({ ctx, profile, step, onSave, history }) {
     h(
       'div',
       { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' } },
-      d.options.map((o) => {
+      options.map((o) => {
         const on = picked.includes(o.id)
         return h(
           'button',

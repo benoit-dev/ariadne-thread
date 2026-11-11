@@ -45,8 +45,8 @@ Open **Ariadne's Thread** in the Desktop sidebar. The page has three tabs.
   - **Config** shows when the job runs next (relative and as a date), then its `model`, `provider`, `enabled_toolsets`, `profile`, `workdir`, `context_from`, `repeat` and `no_agent`, when set. It never shows `base_url`, and it hides any value that looks like a key, a token, or a URL with a password in it.
   - **Thread** shows the skills the job loads and where its output goes. Click a skill to open it.
   - **Runs** lists the latest output files Hermes saved for the job in `cron/output/<job id>/`, with their time and size. Click one to read it. At most the first 256 KB is shown.
-- Click a step to expand it in place: a script step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step shows where each target in `deliver` resolves (platform, chat and thread, by the scheduler's own rules), or why it sends nothing, such as a platform with no home channel. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
-- **Webhooks** lists the routes in `webhook_subscriptions.json` with their events and flow. Its steps open the same way.
+- Click a step to expand it in place: a script step widens to show the script file from `scripts/`, a prompt step shows the whole prompt, and the deliver step lists each target in `deliver` as stored and flags one that sends nothing, such as a platform with no home channel. Which platforms have a home channel comes from Hermes' own `/api/cron/delivery-targets`. A job that only saves its output ends in a **local** deliver step. Click it again to collapse it. A skill step does not expand; its **Go to skill** button opens the skill.
+- **Webhooks** lists the routes from Hermes' own `/api/webhooks`, with their events and flow. That endpoint never returns a route's secret. Its steps open the same way.
 - **Skills** lists the skills in your skills folder and in any folder listed under `skills.external_dirs`, grouped by category folder, with a step count. A selected skill has two views: **Workflow** shows its flow, its related skills, and **Used by**, which lists every cron and webhook that loads the skill with the cron's status and where each one delivers. **SKILL.md** shows the whole file.
 
 Use the profile menu in the header to look at another profile. Other profiles are read-only. Skills from `skills.external_dirs` are also read-only and show an **external** badge. If a local skill and an external skill have the same name, the local one wins, as it does in Hermes.
@@ -58,7 +58,6 @@ An expanded step has an **Edit** button. It turns the step into a text box; **Sa
 - a skill step: the lines of `SKILL.md` that step came from. The rest of the file is left as it was, and the whole file must still pass the frontmatter checks.
 - the whole `SKILL.md`, from the **SKILL.md** view.
 - a cron job's prompt.
-- a webhook route's prompt template. Its secret and other fields are kept.
 - a script step's file in `scripts/`, unless it is over 256 KB.
 - a cron job's delivery targets. Pick from local, the origin chat and the platforms your gateway has set up (⚠ marks one with no home channel yet), or type the comma-separated `deliver` value, such as `telegram,discord:1234`. Enter saves.
 
@@ -66,11 +65,11 @@ Scripts show with line numbers and syntax colours (Python, shell and JavaScript,
 
 When you edit a skill, the line next to **Save** says what the change reaches, such as "Saving affects 3: daily-digest, triage, gh-issues", or that no cron or webhook uses the skill.
 
-Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Trigger steps and webhook deliver steps are read-only.
+Each save sends the text you started from. If the file changed since (a cron run, an agent, another window), the save is refused and nothing is written; reload and try again. Trigger steps and webhook deliver steps are read-only. A webhook prompt is read-only too, because Hermes has no endpoint yet to change one field of a route; its **Ask agent** button drafts the change for a chat instead.
 
 ### Undo an edit
 
-Before each save, Ariadne's Thread keeps a copy of the text it is about to replace. This covers a whole `SKILL.md`, one skill step, a script, a cron prompt, a cron's delivery targets, and a webhook prompt. A skill step edit keeps the whole `SKILL.md`. The last 10 copies of each are kept, and older ones are deleted.
+Before each save, Ariadne's Thread keeps a copy of the text it is about to replace. This covers a whole `SKILL.md`, one skill step, a script, a cron prompt, and a cron's delivery targets. A skill step edit keeps the whole `SKILL.md`. The last 10 copies of each are kept, and older ones are deleted.
 
 An editable step has a **History** button next to **Edit**. It lists the saved copies by time. Pick one to see a diff against the current text, then click **Revert to this version** to write it back. A revert is a save, so it goes through the same checks: it is refused if the text changed since you opened the diff, and it keeps a copy of the text it replaces, so you can undo the revert too. History is available in the active profile only.
 
@@ -90,7 +89,7 @@ It reads:
 
 - `cron/jobs.json`
 - the run output files in `cron/output/<job id>/`, when you open a job's **Runs**. It lists only files named like `2026-11-08_09-00-00.md`, refuses any path that resolves outside that job's folder, and shows at most the first 256 KB.
-- `webhook_subscriptions.json`. Webhook secrets are never sent to the UI.
+- the webhook routes and the cron delivery platforms, from Hermes' own `GET /api/webhooks` and `GET /api/cron/delivery-targets`. The Desktop page calls them through the Desktop bridge (`window.hermesDesktop.api`), because the plugin SDK only reaches the plugin's own API. Both are read-only, and `/api/webhooks` returns no secrets. The plugin never opens `webhook_subscriptions.json` itself.
 - every `SKILL.md` under `skills/`, including skill folders that are symlinks to shared folders
 - `config.yaml`, only to find `skills.external_dirs`, and every `SKILL.md` in those folders
 - a script in `scripts/` when you click a script step, the same folder Hermes runs cron and webhook scripts from. It refuses paths that resolve outside that folder and shows at most the first 256 KB. The script is shown as it is, so anything written into it is visible on screen.
@@ -103,8 +102,7 @@ It writes only when you click **Save**, and only in the active profile:
 - a script in `scripts/`, through a temporary file, keeping its file mode. Paths outside `scripts/` are refused.
 - a cron job's `prompt`, through Hermes' own cron store (`cron.jobs.update_job`), which takes the same lock as the scheduler.
 - a cron job's `deliver`, through the same cron store.
-- a webhook route's `prompt`, through Hermes' own webhook store, which takes the same lock as the gateway and keeps the route's secret.
-- before each of these writes, one history file in `plugin-data/ariadne-thread/history/<kind>/<hash of the target>/`. It holds the replaced text, its kind and target name, and the time. It is written through a temporary file with mode `0600` in folders with mode `0700`. The plugin keeps the newest 10 per target and deletes older ones. For a webhook it stores only the prompt, never the secret or the rest of the route. If the history file cannot be written, the save is refused and nothing changes.
+- before each of these writes, one history file in `plugin-data/ariadne-thread/history/<kind>/<hash of the target>/`. It holds the replaced text, its kind and target name, and the time. It is written through a temporary file with mode `0600` in folders with mode `0700`. The plugin keeps the newest 10 per target and deletes older ones. If the history file cannot be written, the save is refused and nothing changes.
 
 A revert from **History** writes through the same paths as a save.
 
@@ -118,12 +116,10 @@ It does not:
 - run, pause, or resume cron jobs. **Runs** only reads the output files Hermes already wrote.
 - start agent sessions or send messages for you
 - call any network service other than the Hermes backend it is installed in
-- read credentials, `.env` files, or tokens itself
+- read credentials, `.env` files, or tokens, or enter another profile's secret scope
 - collect telemetry
 
-It reads no credentials itself, but two calls into Hermes do. To show where a cron job delivers, it calls Hermes' scheduler, which reads `<PLATFORM>_HOME_CHANNEL` values from Hermes' secrets. For another profile, it first enters that profile's config and secret scope through Hermes, so the scheduler reads that profile's values. The UI shows only the resolved platform, chat and thread.
-
-Hermes has no public seam for some of this work, so the backend has 9 private Hermes imports for cron delivery targets, cron and webhook edits, and profile scoping. A Hermes release can change them. [docs/risk-audit.md](docs/risk-audit.md#core-imports) lists each one and what happens if it goes away.
+Hermes has no public plugin seam for editing a cron job, so the backend imports `cron.jobs` (`get_job` and `update_job`) for the cron prompt and delivery edits. A Hermes release can change it. [docs/risk-audit.md](docs/risk-audit.md#core-imports) explains what happens if it goes away.
 
 After a save, it sends the local event `plugin.ariadne-thread.skills.changed` to open Desktop windows so that they refresh.
 
