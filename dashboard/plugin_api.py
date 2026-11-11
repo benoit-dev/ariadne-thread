@@ -1,17 +1,15 @@
 """Ariadne's Thread: backend API for the Hermes Desktop plugin.
 
 Read-only views over the files Hermes already keeps, plus guarded editing of
-the active profile's own skills, scripts, cron prompts and webhook prompts.
+the active profile's own skills, scripts and cron prompts and delivery targets.
 Nothing here runs a job, a script or a skill, and nothing is sent anywhere:
 
   GET  /health                       -> {ok, name, version, sources}
-  GET  /profiles                     -> {profiles}
+  GET  /profiles                     -> {profiles, serving}; serving is the profile "default" stands for
   GET  /crons                        -> {jobs, total, categories, updated_at}; each job has its
                                         true run status, health, config and issues
-  GET  /crons/{id}/delivery          -> where each deliver token resolves to
   GET  /crons/{id}/runs              -> the run output files Hermes saved, newest first
   GET  /crons/{id}/runs/{run_id}     -> one run's output
-  GET  /webhooks                     -> {routes}
   GET  /skills                       -> {skills, count}
   GET  /skills/{name}                -> skill detail, raw SKILL.md, its parsed flow and used_by
   GET  /scripts?path=...             -> a cron or webhook script from <home>/scripts, with its history ref
@@ -22,7 +20,6 @@ Nothing here runs a job, a script or a skill, and nothing is sent anywhere:
   PUT  /scripts                      -> edit a script in <home>/scripts
   PUT  /crons/{id}/prompt            -> edit a cron job's prompt
   PUT  /crons/{id}/deliver           -> edit a cron job's delivery target
-  PUT  /webhooks/{name}/prompt       -> edit a webhook route's prompt
   POST /history/revert               -> write an earlier version back through the matching PUT
 
 Every edit carries the text the user started from and gets 409 if the file
@@ -32,7 +29,9 @@ take an optional ?profile=<name> to look at another profile's files read-only. P
 are resolved per request because this module can be served from a profile-scoped host
 process.
 
-Webhook HMAC secrets are never serialized, and never stored in the history.
+Webhook routes and delivery targets are not read here: the Desktop page gets them from
+Hermes' own /api/webhooks and /api/cron/delivery-targets, so this module never opens
+webhook_subscriptions.json (which holds every route's HMAC secret) or a profile's .env.
 """
 
 from __future__ import annotations
@@ -47,7 +46,6 @@ import stat
 import tempfile
 import time
 from bisect import bisect_right
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -77,7 +75,7 @@ router = APIRouter()
 _log = logging.getLogger("ariadne-thread")
 
 PLUGIN_NAME = "ariadne-thread"
-PLUGIN_VERSION = "0.2.1"
+PLUGIN_VERSION = "0.2.2"
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_SCRIPT_BYTES = 256 * 1024
 HISTORY_KEEP = 10
@@ -104,7 +102,6 @@ class Roots(NamedTuple):
     skills: Path
     scripts: Path
     cron_jobs: Path
-    webhooks: Path
     editable: bool
     external: tuple[Path, ...] = ()
 
@@ -125,7 +122,6 @@ def _profile_roots(profile: Optional[str]) -> Roots:
         skills=skills,
         scripts=home / "scripts",
         cron_jobs=home / "cron" / "jobs.json",
-        webhooks=home / "webhook_subscriptions.json",
         editable=editable,
         external=_external_skill_dirs(home, skills),
     )
@@ -752,7 +748,7 @@ def _cron_deliver_step(j: dict) -> dict:
     if failure:
         detail = (detail + " \u00b7 " if detail else "") + "failures \u2192 " + failure
     return {"type": "deliver", "kind": "deliver", "label": deliver, "detail": detail,
-            "deliver": deliver, "job_id": j.get("id")}
+            "deliver": deliver, "failure_deliver": failure or None, "job_id": j.get("id")}
 
 
 def _jobs_of(live) -> list[dict]:
@@ -907,70 +903,6 @@ def get_crons(profile: Optional[str] = Query(None)):
     }
 
 
-def _webhook_sequence(name: str, route: dict) -> list[dict]:
-    steps = [{
-        "type": "trigger", "kind": "trigger",
-        "label": f"{name} \u00b7 POST", "detail": f"/webhooks/{name}",
-        "kindLabel": "webhook",
-    }]
-    if route.get("script"):
-        steps.append({
-            "type": "script", "kind": "script",
-            "label": "Script", "detail": str(route["script"]),
-            "kindLabel": "script", "script": str(route["script"]),
-        })
-    prompt = route.get("prompt") or ""
-    steps.append({
-        "type": "prompt", "kind": "prompt", "label": "Prompt",
-        "detail": prompt[:200], "kindLabel": "prompt", "body": prompt,
-    })
-    for skill in _string_list(route.get("skills")):
-        steps.append({
-            "type": "skill", "kind": "skill", "label": skill,
-            "name": skill, "kindLabel": "skill",
-        })
-    deliver = route.get("deliver", "deliver")
-    extra = route.get("deliver_extra") or {}
-    steps.append({
-        "type": "deliver", "kind": "deliver",
-        "label": deliver,
-        "detail": str(extra)[:200],
-        "kindLabel": deliver,
-        "body": json.dumps(extra, indent=2, default=str) if extra else "",
-    })
-    return steps
-
-
-@router.get("/webhooks")
-def get_webhooks(profile: Optional[str] = Query(None)):
-    roots = _profile_roots(profile)
-    if not roots.webhooks.exists():
-        return {"routes": []}
-    raw = _read_json(roots.webhooks, "webhook_subscriptions.json")
-    if not isinstance(raw, dict):
-        return {"routes": []}
-
-    routes = []
-    for name, route in raw.items():
-        if not isinstance(route, dict):
-            continue
-        routes.append({
-            "name": name,
-            "description": route.get("description", ""),
-            "path": f"/webhooks/{name}",
-            "events": route.get("events") or [],
-            "deliver": route.get("deliver", ""),
-            "deliver_extra": route.get("deliver_extra", {}),
-            "skills": _string_list(route.get("skills")),
-            "prompt_preview": (route.get("prompt") or "")[:200],
-            "prompt_full": route.get("prompt") or "",
-            "created_at": route.get("created_at"),
-            "sequence": _webhook_sequence(name, route),
-        })
-    routes.sort(key=lambda r: r["name"])
-    return {"routes": routes}
-
-
 def _related_skills(fm: dict, body: str) -> list[str]:
     meta = fm.get("metadata")
     hermes_meta = meta.get("hermes") if isinstance(meta, dict) else None
@@ -994,7 +926,7 @@ def _uses_skill(skills: list[str], name: str) -> bool:
 
 
 def _used_by(name: str, roots: Roots) -> list[dict]:
-    """The crons and webhook routes that attach a skill, so an edit shows what it reaches."""
+    """The crons that attach a skill; the Desktop page adds the webhook routes from /api/webhooks."""
     users = []
     for j in _jobs_of(_json_or_none(roots.cron_jobs)):
         if _uses_skill(_job_skills(j), name):
@@ -1003,11 +935,7 @@ def _used_by(name: str, roots: Roots) -> list[dict]:
                 "kind": "cron", "id": j.get("id"), "name": j.get("name") or "Unnamed",
                 "deliver": _deliver_text(j.get("deliver")), "status": status, "health": health,
             })
-    routes = _json_or_none(roots.webhooks)
-    for route_name, route in routes.items() if isinstance(routes, dict) else ():
-        if isinstance(route, dict) and _uses_skill(_string_list(route.get("skills")), name):
-            users.append({"kind": "webhook", "name": route_name, "deliver": route.get("deliver") or ""})
-    return sorted(users, key=lambda u: (u["kind"], u["name"]))
+    return sorted(users, key=lambda u: u["name"])
 
 
 class _Summary(NamedTuple):
@@ -1352,128 +1280,12 @@ def put_script(update: ScriptUpdate, profile: Optional[str] = Query(None)):
     return {"ok": True, "path": str(target)}
 
 
-@contextmanager
-def _profile_secrets(profile: Optional[str]):
-    """Hermes' per-profile config and secret scope, so a home channel is read from the profile's own
-    .env. Yields False when another profile cannot be scoped; reading it unscoped would show the
-    default profile's channels."""
-    if profile in (None, "", "default"):
-        yield True
-        return
-    try:
-        from hermes_cli.web_server_profiles import _config_profile_scope
-    except ImportError:
-        yield False
-        return
-    with _config_profile_scope(profile):
-        yield True
-
-
-def _channel_name(platform: str, chat_id: str, directory: dict) -> str:
-    for ch in directory.get(platform) or directory.get(platform.lower()) or []:
-        if isinstance(ch, dict) and str(ch.get("id")) == chat_id:
-            return str(ch.get("name") or "")
-    return ""
-
-
-def _unresolved(sd, token: str) -> str:
-    if token.lower() == "origin":
-        return "the job has no origin chat and no platform has a home channel"
-    if token.lower() == "all":
-        return "no platform has a home channel"
-    if ":" in token:
-        return "Hermes could not resolve this chat"
-    if not sd._is_known_delivery_platform(token):
-        return "not a delivery platform Hermes knows (is its plugin enabled?)"
-    env = sd._resolve_home_env_var(token)
-    return "no home channel is set" + (f" ({env})" if env else "") + "; run /sethome there"
-
-
-def _resolve_deliver(job: dict, deliver: str) -> list[dict]:
-    """Where each comma-separated token of ``deliver`` goes, resolved by the scheduler's own code."""
-    tokens = [t.strip() for t in deliver.split(",") if t.strip() and t.strip() != "local"]
-    try:
-        from cron import scheduler_delivery as sd
-    except ImportError:
-        return [{"token": t, "targets": [], "error": "resolving targets needs a newer Hermes"} for t in tokens]
-    try:
-        from gateway.channel_directory import load_directory
-
-        directory = load_directory().get("platforms") or {}
-    except Exception:
-        directory = {}
-    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
-    out = []
-    for token in tokens:
-        entry: dict = {"token": token, "targets": []}
-        try:
-            broadcast = token.lower() in sd._ROUTING_TOKENS
-            for part in sd._expand_routing_tokens(token):
-                t = sd._resolve_single_delivery_target(job, part, from_broadcast=broadcast)
-                if not t:
-                    continue
-                platform, chat_id = str(t.get("platform") or ""), str(t.get("chat_id") or "")
-                via = t.get("_resolved_from") or ""
-                name = _channel_name(platform, chat_id, directory)
-                if not name and via.startswith("origin") and str(origin.get("chat_id")) == chat_id:
-                    name = str(origin.get("chat_name") or "")
-                entry["targets"].append({
-                    "platform": platform, "chat_id": chat_id, "name": name, "via": via,
-                    "thread_id": None if t.get("thread_id") is None else str(t["thread_id"]),
-                })
-            if not entry["targets"]:
-                entry["error"] = _unresolved(sd, token)
-        except Exception as exc:
-            entry["error"] = f"could not resolve: {exc}"
-        out.append(entry)
-    return out
-
-
-def _delivery_options() -> list[dict]:
-    options = [{"id": "local", "name": "Local (save only)", "ready": True},
-               {"id": "origin", "name": "Origin chat", "ready": True}]
-    try:
-        from cron.scheduler_delivery import cron_delivery_targets
-
-        options += [{"id": t["id"], "name": t.get("name") or t["id"], "ready": bool(t.get("home_target_set"))}
-                    for t in cron_delivery_targets() if t.get("id")]
-    except Exception:
-        _log.debug("cron_delivery_targets unavailable", exc_info=True)
-    return options
-
-
 def _job_or_none(roots: Roots, job_id: str) -> Optional[dict]:
     if roots.cron_jobs.exists():
         for j in _jobs_of(_read_json(roots.cron_jobs, "jobs.json")):
             if str(j.get("id")) == job_id:
                 return j
     return None
-
-
-def _find_job(roots: Roots, job_id: str) -> dict:
-    job = _job_or_none(roots, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"cron job not found: {job_id}")
-    return job
-
-
-@router.get("/crons/{job_id}/delivery")
-def get_cron_delivery(job_id: str, profile: Optional[str] = Query(None)):
-    job = _find_job(_profile_roots(profile), job_id)
-    deliver = _deliver_text(job.get("deliver"))
-    failure = _deliver_text(job.get("failure_deliver"), "")
-    origin = job.get("origin") if isinstance(job.get("origin"), dict) else None
-    result = {"deliver": deliver, "failure_deliver": failure or None, "origin": origin, "options": [],
-              "targets": [], "failure_targets": []}
-    with _profile_secrets(profile) as scoped:
-        if not scoped:
-            note = "resolving another profile's targets needs a newer Hermes"
-            result["targets"] = [{"token": t, "targets": [], "error": note} for t in deliver.split(",") if t.strip() not in ("", "local")]
-            return result
-        result["targets"] = _resolve_deliver(job, deliver)
-        result["failure_targets"] = _resolve_deliver(job, failure) if failure else []
-        result["options"] = _delivery_options()
-    return result
 
 
 def _run_dir(roots: Roots, job_id: str) -> Path:
@@ -1532,8 +1344,8 @@ def get_cron_run(job_id: str, run_id: str, profile: Optional[str] = Query(None))
     }
 
 
-# Cron jobs and webhook routes are written through Hermes' own store functions, which hold
-# the same locks as the scheduler and the gateway, so an edit here cannot race a run.
+# Cron jobs are written through Hermes' own cron.jobs store, which holds the scheduler's lock,
+# so an edit here cannot race a run.
 @router.put("/crons/{job_id}/prompt")
 def put_cron_prompt(job_id: str, update: TextUpdate, profile: Optional[str] = Query(None)):
     roots = _editable_roots(profile, "cron jobs")
@@ -1573,26 +1385,6 @@ def put_cron_deliver(job_id: str, update: TextUpdate, profile: Optional[str] = Q
     return {"ok": True, "id": job_id, "deliver": deliver}
 
 
-@router.put("/webhooks/{name}/prompt")
-def put_webhook_prompt(name: str, update: TextUpdate, profile: Optional[str] = Query(None)):
-    roots = _editable_roots(profile, "webhooks")
-    try:
-        from hermes_cli.webhook import SubscriptionMutationConflict, _load_subscriptions, _replace_subscription
-    except ImportError:
-        raise HTTPException(status_code=501, detail="editing webhook routes needs a newer Hermes")
-    route = _load_subscriptions().get(name)
-    if not isinstance(route, dict):
-        raise HTTPException(status_code=404, detail=f"webhook route not found: {name}")
-    if (route.get("prompt") or "") != update.expected:
-        raise HTTPException(status_code=409, detail=f"The prompt {_CONFLICT}")
-    _record_history(roots, "webhook-prompt", name, route.get("prompt") or "", update.content)
-    try:
-        _replace_subscription(name, {**route, "prompt": update.content}, route)
-    except SubscriptionMutationConflict:
-        raise HTTPException(status_code=409, detail=f"The route {_CONFLICT}")
-    return {"ok": True, "name": name}
-
-
 class _HistoryKind(NamedTuple):
     current: Callable[[str, Roots], Optional[str]]
     write: Callable[[str, str, str], dict]
@@ -1620,12 +1412,6 @@ def _cron_deliver_current(ref: str, roots: Roots) -> Optional[str]:
     return None if job is None else _deliver_text(job.get("deliver"))
 
 
-def _webhook_prompt_current(ref: str, roots: Roots) -> Optional[str]:
-    routes = _json_or_none(roots.webhooks)
-    route = routes.get(ref) if isinstance(routes, dict) else None
-    return route.get("prompt") or "" if isinstance(route, dict) else None
-
-
 # A revert is a save through the same PUT handler, so it is conflict-checked and recorded like one.
 _HISTORY_KINDS: dict[str, _HistoryKind] = {
     "skill": _HistoryKind(
@@ -1643,10 +1429,6 @@ _HISTORY_KINDS: dict[str, _HistoryKind] = {
     "cron-deliver": _HistoryKind(
         _cron_deliver_current,
         lambda ref, expected, content: put_cron_deliver(ref, TextUpdate(expected=expected, content=content), None),
-    ),
-    "webhook-prompt": _HistoryKind(
-        _webhook_prompt_current,
-        lambda ref, expected, content: put_webhook_prompt(ref, TextUpdate(expected=expected, content=content), None),
     ),
 }
 
@@ -1721,13 +1503,19 @@ def revert_history(request: RevertRequest, profile: Optional[str] = Query(None))
     return {**result, "reverted": request.id}
 
 
+def _serving_profile() -> str:
+    """The profile this backend serves as "default", named the way core's ?profile= expects it."""
+    home, profiles_dir = get_hermes_home().resolve(), (get_default_hermes_root() / "profiles").resolve()
+    return home.name if home.parent == profiles_dir and _PROFILE_RE.match(home.name) else "default"
+
+
 @router.get("/profiles")
 def list_profiles():
     names = ["default"]
     profiles_dir = get_default_hermes_root() / "profiles"
     if profiles_dir.is_dir():
         names += sorted(p.name for p in profiles_dir.iterdir() if p.is_dir() and _PROFILE_RE.match(p.name))
-    return {"profiles": names}
+    return {"profiles": names, "serving": _serving_profile()}
 
 
 @router.get("/health")
@@ -1739,7 +1527,6 @@ def health():
         "version": PLUGIN_VERSION,
         "sources": {
             "crons": roots.cron_jobs.exists(),
-            "webhooks": roots.webhooks.exists(),
             "skills_root": roots.skills.exists(),
         },
     }

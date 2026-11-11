@@ -81,13 +81,12 @@ def names(response) -> list[str]:
 
 def test_empty_home_has_empty_lists_and_no_errors(client):
     assert client.get("/crons").json() == {"jobs": [], "total": 0, "categories": {}, "updated_at": ""}
-    assert client.get("/webhooks").json() == {"routes": []}
     assert client.get("/skills").json() == {"skills": [], "count": 0}
-    assert client.get("/profiles").json() == {"profiles": ["default"]}
+    assert client.get("/profiles").json() == {"profiles": ["default"], "serving": "default"}
     health = client.get("/health").json()
     assert health["name"] == "ariadne-thread"
-    assert health["version"] == "0.2.1"
-    assert health["sources"] == {"crons": False, "webhooks": False, "skills_root": False}
+    assert health["version"] == "0.2.2"
+    assert health["sources"] == {"crons": False, "skills_root": False}
 
 
 def test_paths_follow_the_home_on_every_request(client, home, tmp_path_factory, monkeypatch):
@@ -192,7 +191,15 @@ def test_unknown_and_malformed_skill_names(client, home):
 def test_profile_name_is_validated_and_must_exist(client, home):
     assert client.get("/skills", params={"profile": "Bad Name"}).status_code == 400
     assert client.get("/crons", params={"profile": "../escape"}).status_code == 400
-    assert client.get("/webhooks", params={"profile": "ghost"}).status_code == 404
+    assert client.get("/skills", params={"profile": "ghost"}).status_code == 404
+
+
+def test_profiles_name_the_profile_this_backend_serves(client, home, monkeypatch):
+    work = home / "profiles" / "work"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(work))
+
+    assert client.get("/profiles").json()["serving"] == "work"
 
 
 def test_other_profiles_are_listed_and_read_only(client, home):
@@ -202,7 +209,7 @@ def test_other_profiles_are_listed_and_read_only(client, home):
     (home / "profiles" / ".deleted").mkdir(parents=True)
     (home / "profiles" / "Not_Valid").mkdir()
 
-    assert client.get("/profiles").json() == {"profiles": ["default", "work"]}
+    assert client.get("/profiles").json() == {"profiles": ["default", "work"], "serving": "default"}
 
     skills = client.get("/skills", params={"profile": "work"}).json()["skills"]
     assert [(s["name"], s["editable"]) for s in skills] == [("work-skill", False)]
@@ -434,7 +441,7 @@ def test_cron_category_comes_from_the_first_attached_skill_that_exists(client, h
     assert jobs["notes"]["sequence"][-1]["label"] == "telegram"
 
 
-def test_skill_detail_lists_the_crons_and_webhooks_that_use_it(client, home):
+def test_skill_detail_lists_the_crons_that_use_it(client, home):
     write_skill(home / "skills", "research/arxiv")
     write_json(
         home / "cron" / "jobs.json",
@@ -444,14 +451,6 @@ def test_skill_detail_lists_the_crons_and_webhooks_that_use_it(client, home):
             {"id": "jx", "name": "x", "skills": ["other"]},
         ]},
     )
-    write_json(
-        home / "webhook_subscriptions.json",
-        {
-            "z-hook": {"skills": ["arxiv", "other"], "deliver": "slack", "secret": "s3cr3t"},
-            "a-hook": {"skills": "arxiv"},
-            "unrelated": {"skills": ["other"]},
-        },
-    )
 
     detail = client.get("/skills/arxiv").json()
 
@@ -459,8 +458,6 @@ def test_skill_detail_lists_the_crons_and_webhooks_that_use_it(client, home):
     assert detail["used_by"] == [
         {"kind": "cron", "id": "ja", "name": "a-job", "deliver": "local", "status": "paused", "health": "paused"},
         {"kind": "cron", "id": "jb", "name": "b-job", "deliver": "telegram,discord:9", "status": "error", "health": "error"},
-        {"kind": "webhook", "name": "a-hook", "deliver": ""},
-        {"kind": "webhook", "name": "z-hook", "deliver": "slack"},
     ]
 
 
@@ -474,38 +471,25 @@ def test_unreadable_cron_file_is_reported_not_swallowed(client, home):
     assert "jobs.json" in response.json()["detail"]
 
 
-def test_webhooks_never_expose_the_secret_or_a_host(client, home):
-    secret = "s3cr3t-hmac-value-1234"
-    write_json(
-        home / "webhook_subscriptions.json",
-        {
-            "github-push": {
-                "secret": secret,
-                "description": "Repo pushes",
-                "events": ["push"],
-                "prompt": "Review {repository.name}",
-                "skills": ["code-review"],
-                "deliver": "telegram",
-                "deliver_extra": {"chat_id": "42"},
-                "script": "filter.py",
-            },
-            "broken": "not-a-route",
-        },
-    )
+def test_the_backend_never_reads_or_writes_the_webhook_store(client, home):
+    """Webhook routes hold their HMAC secrets, so the page reads them from core's /api/webhooks."""
+    write_skill(home / "skills", "code-review")
+    store = home / "webhook_subscriptions.json"
+    write_json(store, {"gh": {"secret": "s3cr3t-hmac-value-1234", "prompt": "Old", "skills": ["code-review"]}})
+    before = store.read_bytes()
 
-    response = client.get("/webhooks")
-    route = response.json()["routes"][0]
+    responses = [
+        client.get("/webhooks"),
+        client.get("/skills/code-review"),
+        client.get("/health"),
+        client.put("/webhooks/gh/prompt", json={"expected": "Old", "content": "New"}),
+        client.get("/history", params={"kind": "webhook-prompt", "ref": "gh"}),
+    ]
 
-    assert [r["name"] for r in response.json()["routes"]] == ["github-push"]
-    assert secret not in response.text
-    assert "secret" not in route
-    assert route["path"] == "/webhooks/github-push"
-    assert "127.0.0.1" not in response.text and "http://" not in response.text
-    trigger, script, prompt, skill, deliver = route["sequence"]
-    assert trigger["detail"] == "/webhooks/github-push"
-    assert (script["label"], script["detail"]) == ("Script", "filter.py")
-    assert skill["name"] == "code-review"
-    assert deliver["label"] == "telegram"
+    assert [r.status_code for r in responses] == [404, 200, 200, 404, 400]
+    assert not any("s3cr3t" in r.text for r in responses)
+    assert responses[1].json()["used_by"] == []
+    assert store.read_bytes() == before
 
 
 def flow(api, body: str, **fm):
@@ -927,26 +911,18 @@ def test_every_cron_ends_in_a_deliver_step_even_when_it_only_saves(client, home)
     assert loud["detail"] == "failures \u2192 local"
 
 
-def test_delivery_resolves_each_target_the_way_the_scheduler_does(client, home, monkeypatch):
-    pytest.importorskip("cron.scheduler_delivery")
-    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "777")
-    write_json(home / "channel_directory.json", {"platforms": {"telegram": [{"id": "777", "name": "Ops room"}]}})
+def test_the_deliver_step_carries_the_stored_targets_unresolved(client, home):
+    """Targets are shown as stored; the page asks core's /api/cron/delivery-targets which can receive."""
     write_json(
         home / "cron" / "jobs.json",
-        {"jobs": [{
-            "id": "j1", "name": "n", "prompt": "x", "deliver": "origin,telegram,nowhere,local",
-            "origin": {"platform": "discord", "chat_id": "55", "chat_name": "General"},
-        }]},
+        {"jobs": [{"id": "j1", "name": "n", "prompt": "x", "deliver": "origin,telegram", "failure_deliver": "slack"}]},
     )
 
-    body = client.get("/crons/j1/delivery").json()
+    (job,) = client.get("/crons").json()["jobs"]
 
-    origin, tg, bad = body["targets"]
-    assert origin["targets"] == [{"platform": "discord", "chat_id": "55", "name": "General", "via": "origin", "thread_id": None}]
-    assert tg["targets"][0]["chat_id"] == "777" and tg["targets"][0]["name"] == "Ops room"
-    assert bad["token"] == "nowhere" and not bad["targets"] and "not a delivery platform" in bad["error"]
-    assert [o["id"] for o in body["options"]][:2] == ["local", "origin"]
-    assert client.get("/crons/missing/delivery").status_code == 404
+    deliver = job["sequence"][-1]
+    assert (deliver["deliver"], deliver["failure_deliver"], deliver["job_id"]) == ("origin,telegram", "slack", "j1")
+    assert client.get("/crons/j1/delivery").status_code == 404
 
 
 def test_a_cron_delivery_target_is_saved_through_the_hermes_cron_store(client, home):
@@ -963,20 +939,6 @@ def test_a_cron_delivery_target_is_saved_through_the_hermes_cron_store(client, h
     cleared = client.put(path, json={"expected": "telegram,discord:9", "content": "  "})
     assert cleared.json()["deliver"] == cron_jobs.get_job(job["id"])["deliver"] == "local"
     assert client.put(path + "?profile=other", json={"expected": "local", "content": "x"}).status_code in (403, 404)
-
-
-def test_a_webhook_prompt_is_saved_and_the_secret_is_kept(client, home):
-    pytest.importorskip("hermes_cli.webhook")
-    write_json(home / "webhook_subscriptions.json", {"gh": {"prompt": "Old", "secret": "s3cret", "events": ["push"]}})
-
-    stale = client.put("/webhooks/gh/prompt", json={"expected": "Older", "content": "New"})
-    saved = client.put("/webhooks/gh/prompt", json={"expected": "Old", "content": "New"})
-
-    assert stale.status_code == 409
-    assert saved.status_code == 200, saved.text
-    assert "s3cret" not in saved.text
-    stored = json.loads((home / "webhook_subscriptions.json").read_text())
-    assert stored["gh"] == {"prompt": "New", "secret": "s3cret", "events": ["push"]}
 
 
 def test_a_whole_skill_save_is_refused_when_the_file_changed_since_it_was_read(client, home):
@@ -1302,23 +1264,11 @@ def cron_deliver_case(client, home):
     )
 
 
-def webhook_prompt_case(client, home):
-    pytest.importorskip("hermes_cli.webhook")
-    store = home / "webhook_subscriptions.json"
-    write_json(store, {"gh": {"prompt": "Old", "secret": "s3cr3t-hmac-value-1234", "events": ["push"]}})
-    return HistoryCase(
-        "webhook-prompt", "gh", "Old", "New",
-        lambda expected, content: client.put("/webhooks/gh/prompt", json={"expected": expected, "content": content}),
-        lambda: json.loads(store.read_text())["gh"]["prompt"],
-    )
-
-
 HISTORY_CASES = {
     "skill": skill_case,
     "script": script_case,
     "cron-prompt": cron_prompt_case,
     "cron-deliver": cron_deliver_case,
-    "webhook-prompt": webhook_prompt_case,
 }
 
 
@@ -1435,19 +1385,6 @@ def test_a_step_edit_records_the_whole_skill_file(client, home):
     saved = client.get("/history/version", params={"kind": "skill", "ref": "steps", "id": listed["id"]}).json()
     assert saved["content"] == STEP_SKILL
     assert "Changed." in saved["current"]
-
-
-def test_a_webhook_secret_never_reaches_the_history(client, home):
-    case = webhook_prompt_case(client, home)
-    case.save("Old", "Newer")
-    case.save("Newer", "Newest")
-    revert(client, case, versions(client, case)[-1]["id"], "Newest")
-
-    stored = [p.read_text() for p in (home / "plugin-data").rglob("*") if p.is_file()]
-
-    assert len(stored) == 3
-    assert not any("s3cr3t-hmac-value-1234" in text for text in stored)
-    assert "s3cr3t-hmac-value-1234" not in client.get("/history", params={"kind": case.kind, "ref": case.ref}).text
 
 
 def test_a_version_shows_the_current_text_as_a_diff_and_survives_a_deleted_target(client, home):
